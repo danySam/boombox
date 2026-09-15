@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = ["crates/boombox-core", "crates/boombox-ipc", "crates/boombox-tui", "crates/boombox"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/danySam/boombox"
+
+[workspace.dependencies]
+libc = "0.2"
+boombox-core = { path = "crates/boombox-core" }
+boombox-ipc = { path = "crates/boombox-ipc" }
+boombox-tui = { path = "crates/boombox-tui" }
+
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures = "0.3"
+# Album art is JPEG; only that decoder is needed.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+directories = "6"
+keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
+# default-features off drops native-tls (we use rustls everywhere else) and
+# the mDNS discovery stack, which advertises on the LAN and is not wanted:
+# boombox registers with Spotify over the network, not via local discovery.
+librespot = { version = "0.8", default-features = false, features = [
+    "rodio-backend",
+    "rustls-tls-native-roots",
+] }
+open = "5"
+percent-encoding = "2"
+rand = "0.9"
+rustfft = "6"
+ratatui = "0.30"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "test-util"] }
+toml = "0.9"
+# Edits the config file in place, keeping the comments people leave in it.
+toml_edit = "0.25.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+strip = true

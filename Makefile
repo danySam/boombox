@@ -1,0 +1,63 @@
+# cargo has no post-build hook, so code signing lives here.
+# See scripts/codesign.sh for why dev builds are signed at all.
+
+.PHONY: build build-streaming release release-streaming install run daemon tui test lint fmt check setup-codesign unsign-teardown
+
+build:
+	cargo build
+	@./scripts/codesign.sh target/debug/boombox
+	@echo "note: no streaming or visualisations. use 'make build-streaming' for those."
+
+# NOTE: target/debug/boombox is shared between feature sets -- a plain `make
+# build` overwrites the streaming binary and vice versa.
+build-streaming:
+	cargo build --features streaming
+	@./scripts/codesign.sh target/debug/boombox
+
+release:
+	cargo build --release
+	@./scripts/codesign.sh target/release/boombox
+
+release-streaming:
+	cargo build --release --features streaming
+	@./scripts/codesign.sh target/release/boombox
+
+# Puts boombox on your PATH with everything switched on. Without this, a bare
+# `boombox` runs whatever cargo installed last, which is not what you just built.
+install:
+	cargo install --locked --path crates/boombox --features streaming --force
+	@./scripts/codesign.sh "$$HOME/.cargo/bin/boombox"
+	@echo "installed $$(command -v boombox)"
+
+run: build
+	./target/debug/boombox
+
+tui: build
+	./target/debug/boombox tui
+
+daemon: build
+	./target/debug/boombox daemon
+
+test:
+	cargo test
+	cargo test --features streaming
+
+lint:
+	cargo clippy --all-targets
+
+fmt:
+	cargo fmt
+
+check: fmt lint test
+
+# One-time: create the local signing identity (asks for your login password).
+setup-codesign:
+	./scripts/setup-codesign.sh
+
+# Remove the signing identity, its trust setting, and the search-list entry.
+unsign-teardown:
+	-security list-keychains -d user -s "$$HOME/Library/Keychains/login.keychain-db"
+	-security remove-trusted-cert "$$HOME/Library/Keychains/boombox-codesign.crt"
+	-security delete-keychain "$$HOME/Library/Keychains/boombox-codesign.keychain-db"
+	-rm -f "$$HOME/Library/Keychains/boombox-codesign.crt"
+	@echo "signing identity removed; builds go back to ad-hoc signatures"

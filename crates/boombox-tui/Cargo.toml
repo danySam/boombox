@@ -1,0 +1,23 @@
+[package]
+name = "boombox-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+boombox-core.workspace = true
+
+anyhow.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+base64.workspace = true
+image.workspace = true
+ratatui.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
