@@ -67,7 +67,11 @@ pub struct StreamingConfig {
     /// sign-in, without which the daemon says so once and leaves it alone.
     pub enabled: bool,
     /// The name shown in Spotify's device picker.
-    pub device_name: String,
+    ///
+    /// Unset means one built from this machine's own name, so two computers
+    /// running boombox do not both appear as "boombox" -- which the person
+    /// choosing cannot tell apart, and nor could boombox itself.
+    pub device_name: Option<String>,
     /// 96, 160 or 320 kbps.
     pub bitrate: u16,
     /// 0-100. Spotify's wire format is 0-65535; the conversion is internal.
@@ -82,7 +86,7 @@ impl Default for StreamingConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            device_name: "boombox".into(),
+            device_name: None,
             bitrate: 320,
             initial_volume: 50,
             backend: None,
@@ -327,7 +331,9 @@ keyring = false
 # therefore has to be awake. Premium only.
 [streaming]
 enabled = true
-device_name = "boombox"
+# Shown in Spotify's device picker. Left out, it is "boombox on <this
+# machine>", so two computers running boombox stay tellable apart.
+# device_name = "boombox"
 bitrate = 320
 initial_volume = 50
 normalisation = false
@@ -395,6 +401,7 @@ mod editing_tests {
         assert_eq!(parsed.streaming.enabled, default.streaming.enabled);
         assert_eq!(parsed.daemon.adopt_playback, default.daemon.adopt_playback);
         assert_eq!(parsed.daemon.autostart, default.daemon.autostart);
+        assert_eq!(parsed.streaming.device_name, default.streaming.device_name);
     }
 
     /// Appearing in the device list is free; taking playback is not.

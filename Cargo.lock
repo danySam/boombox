@@ -230,6 +230,7 @@ dependencies = [
  "open",
  "rustfft",
  "serde_json",
+ "sysinfo",
  "tokio",
  "toml",
  "tracing",

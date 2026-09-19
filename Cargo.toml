@@ -40,6 +40,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Only for the machine's own name, which the default device name is built
+# from. Already in the tree under librespot-core, so it costs a build nothing.
+sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "test-util"] }
 toml = "0.9"

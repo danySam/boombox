@@ -310,9 +310,13 @@ boombox setup                      # offers it as the last step
 ```toml
 [streaming]
 enabled = true
-device_name = "boombox"
+# device_name = "boombox"   # default: boombox on <this machine>
 bitrate = 320
 ```
+
+The device is named after the machine it runs on — `boombox on studio` — so
+running boombox on a second computer does not put two identical rows in the
+picker. Set `device_name` to override it.
 
 **It is a handoff, not a parallel stream.** Spotify allows one active stream
 per account, so once you pick boombox, playback stops wherever it was. boombox appears in `boombox devices` like any other target and sits idle

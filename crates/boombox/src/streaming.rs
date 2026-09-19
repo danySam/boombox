@@ -81,6 +81,32 @@ pub async fn authorize(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// The name this machine's Connect device registers under.
+///
+/// A configured name is used exactly as written. Otherwise it is built from
+/// the machine's own name, because the alternative -- every install calling
+/// itself "boombox" -- puts two identical rows in the device picker as soon
+/// as someone runs it on a second computer.
+pub fn device_name(config: &Config) -> String {
+    config
+        .streaming
+        .device_name
+        .clone()
+        .unwrap_or_else(|| default_device_name(sysinfo::System::host_name()))
+}
+
+/// "boombox on studio", or plain "boombox" from a machine that will not say
+/// what it is called.
+fn default_device_name(host: Option<String>) -> String {
+    // "studio.local" and "studio.lan" are the same machine as "studio", and
+    // the domain is noise in a picker.
+    let host = host.unwrap_or_default();
+    match host.split('.').next().unwrap_or_default().trim() {
+        "" => "boombox".to_string(),
+        machine => format!("boombox on {machine}"),
+    }
+}
+
 /// Whether the streaming sign-in has been done on this machine.
 pub fn authorized() -> bool {
     boombox_core::private::librespot_credentials().is_ok_and(|path| path.exists())
@@ -221,8 +247,9 @@ pub async fn start(config: &Config) -> Result<Streaming> {
         Box::new(TappedSink { inner: backend(None, AudioFormat::default()), tap: sink_tap })
     });
 
+    let name = device_name(config);
     let connect_config = ConnectConfig {
-        name: settings.device_name.clone(),
+        name: name.clone(),
         // Computer rather than Speaker: this is a machine you sit at, and the
         // icon in the picker should say so.
         device_type: DeviceType::Computer,
@@ -239,12 +266,51 @@ pub async fn start(config: &Config) -> Result<Streaming> {
     // goes silent. The handle is kept so its ending can be noticed.
     let task = tokio::spawn(spirc_task);
 
-    Ok(Streaming { spirc, device_name: settings.device_name.clone(), tap, task: Some(task) })
+    Ok(Streaming { spirc, device_name: name, tap, task: Some(task) })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two machines with one name each, rather than two rows both called
+    /// "boombox".
+    #[test]
+    fn the_default_name_carries_the_machine() {
+        assert_eq!(default_device_name(Some("studio".into())), "boombox on studio");
+    }
+
+    /// mDNS and DHCP hand out names with a domain attached; the machine is
+    /// the part worth showing.
+    #[test]
+    fn the_domain_is_dropped_from_the_machine_name() {
+        assert_eq!(default_device_name(Some("studio.local".into())), "boombox on studio");
+        assert_eq!(default_device_name(Some("studio.lan.example".into())), "boombox on studio");
+    }
+
+    /// A machine that will not say must still get a usable name.
+    #[test]
+    fn a_nameless_machine_falls_back_to_the_bare_name() {
+        assert_eq!(default_device_name(None), "boombox");
+        assert_eq!(default_device_name(Some(String::new())), "boombox");
+        assert_eq!(default_device_name(Some("   ".into())), "boombox");
+        assert_eq!(default_device_name(Some(".".into())), "boombox");
+    }
+
+    /// A name in the config is a decision, not a suggestion.
+    #[test]
+    fn a_configured_name_is_used_exactly_as_written() {
+        let mut config = Config::default();
+        config.streaming.device_name = Some("Kitchen".into());
+        assert_eq!(device_name(&config), "Kitchen");
+    }
+
+    /// The name is per machine, so it must not be baked into the config file
+    /// that setup writes -- one copied to another computer would carry it.
+    #[test]
+    fn nothing_is_configured_by_default() {
+        assert_eq!(Config::default().streaming.device_name, None);
+    }
 
     #[test]
     fn bitrates_map_to_the_three_spotify_offers() {

@@ -218,7 +218,7 @@ async fn sign_in_if_needed(config: &Config, client_id: String) -> Result<()> {
 #[cfg(feature = "streaming")]
 async fn audio(config: &Config) -> Result<()> {
     let authorized = crate::streaming::authorized();
-    let name = &config.streaming.device_name;
+    let name = crate::streaming::device_name(config);
     if authorized && config.streaming.enabled {
         println!("{TICK} boombox plays audio here, as the device \"{name}\"");
         return Ok(());

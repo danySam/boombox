@@ -10,7 +10,7 @@ repository.workspace = true
 default = []
 # Embed librespot so the daemon becomes a Spotify Connect device that decodes
 # and plays audio itself, rather than only driving other devices.
-streaming = ["dep:librespot", "dep:rustfft"]
+streaming = ["dep:librespot", "dep:rustfft", "dep:sysinfo"]
 
 [[bin]]
 name = "boombox"
@@ -24,6 +24,7 @@ boombox-tui.workspace = true
 
 librespot = { workspace = true, optional = true }
 rustfft = { workspace = true, optional = true }
+sysinfo = { workspace = true, optional = true }
 
 anyhow.workspace = true
 clap.workspace = true

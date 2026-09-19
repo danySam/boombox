@@ -145,7 +145,7 @@ pub async fn run(config: &Config) -> Result<()> {
         #[cfg(feature = "streaming")]
         stall: Arc::new(RwLock::new(crate::stall::StallWatch::default())),
         #[cfg(feature = "streaming")]
-        device_name: config.streaming.device_name.clone(),
+        device_name: crate::streaming::device_name(config),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
