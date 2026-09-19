@@ -15,8 +15,18 @@ use boombox_core::api::PlaybackState;
 pub const STALL_AFTER: Duration = Duration::from_secs(15);
 
 /// Whether Spotify reports this device as the one playing.
-pub fn playing_here(state: Option<&PlaybackState>, device_name: &str) -> bool {
-    state.is_some_and(|s| s.is_playing && s.device.as_ref().is_some_and(|d| d.name == device_name))
+///
+/// By id rather than name: names are the user's to choose and two machines
+/// can share one, which would have this machine reporting on another's
+/// silence. `None` is no device of our own registered, so nothing can be
+/// playing here.
+pub fn playing_here(state: Option<&PlaybackState>, device_id: Option<&str>) -> bool {
+    let Some(device_id) = device_id else {
+        return false;
+    };
+    state.is_some_and(|s| {
+        s.is_playing && s.device.as_ref().is_some_and(|d| d.id.as_deref() == Some(device_id))
+    })
 }
 
 #[derive(Debug, Default)]
@@ -150,13 +160,40 @@ mod tests {
 
     #[test]
     fn only_this_device_playing_counts_as_playing_here() {
-        let here = state(r#"{"device":{"name":"boombox","type":"Computer"},"is_playing":true}"#);
-        let paused = state(r#"{"device":{"name":"boombox","type":"Computer"},"is_playing":false}"#);
+        let here = state(
+            r#"{"device":{"id":"ours","name":"boombox on studio","type":"Computer"},
+                "is_playing":true}"#,
+        );
+        let paused = state(
+            r#"{"device":{"id":"ours","name":"boombox on studio","type":"Computer"},
+                "is_playing":false}"#,
+        );
         let elsewhere =
-            state(r#"{"device":{"name":"Kitchen","type":"Speaker"},"is_playing":true}"#);
-        assert!(playing_here(Some(&here), "boombox"));
-        assert!(!playing_here(Some(&paused), "boombox"));
-        assert!(!playing_here(Some(&elsewhere), "boombox"));
-        assert!(!playing_here(None, "boombox"));
+            state(r#"{"device":{"id":"kit","name":"Kitchen","type":"Speaker"},"is_playing":true}"#);
+        assert!(playing_here(Some(&here), Some("ours")));
+        assert!(!playing_here(Some(&paused), Some("ours")));
+        assert!(!playing_here(Some(&elsewhere), Some("ours")));
+        assert!(!playing_here(None, Some("ours")));
+    }
+
+    /// The reason this goes by id: the same name on two machines must not
+    /// have one of them reporting on the other's silence.
+    #[test]
+    fn another_machine_sharing_our_name_is_not_us() {
+        let twin = state(
+            r#"{"device":{"id":"theirs","name":"boombox on studio","type":"Computer"},
+                "is_playing":true}"#,
+        );
+        assert!(!playing_here(Some(&twin), Some("ours")));
+    }
+
+    /// Before the Connect session is up there is no device to be playing on.
+    #[test]
+    fn nothing_is_playing_here_without_a_device_of_our_own() {
+        let playing = state(
+            r#"{"device":{"id":"ours","name":"boombox on studio","type":"Computer"},
+                "is_playing":true}"#,
+        );
+        assert!(!playing_here(Some(&playing), None));
     }
 }

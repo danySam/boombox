@@ -164,6 +164,7 @@ impl Sink for TappedSink {
 pub struct Streaming {
     spirc: Spirc,
     device_name: String,
+    device_id: String,
     tap: Arc<SpectrumTap>,
     /// The protocol loop. Finishing is how a dropped session announces
     /// itself: librespot logs the disconnection and the task returns, and
@@ -175,6 +176,12 @@ pub struct Streaming {
 impl Streaming {
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    /// What Spotify calls this device. Unlike the name, it is ours alone,
+    /// even when someone runs boombox under the same name on two machines.
+    pub fn device_id(&self) -> &str {
+        &self.device_id
     }
 
     /// Shared handle to the audio tap, so the daemon can serve spectrum
@@ -225,6 +232,12 @@ pub async fn start(config: &Config) -> Result<Streaming> {
     // Deliberately NOT our Web API client_id -- see login() for why.
     let session = Session::new(SessionConfig::default(), Some(cache));
 
+    // Taken before Spirc consumes the session. librespot makes this a fresh
+    // UUID per process and publishes it as the Connect device's id, which is
+    // the same id the Web API then reports -- so it, and not the name, is how
+    // the daemon recognises its own device.
+    let device_id = session.device_id().to_string();
+
     let player_config = PlayerConfig {
         bitrate: bitrate_from(settings.bitrate)?,
         normalisation: settings.normalisation,
@@ -266,7 +279,7 @@ pub async fn start(config: &Config) -> Result<Streaming> {
     // goes silent. The handle is kept so its ending can be noticed.
     let task = tokio::spawn(spirc_task);
 
-    Ok(Streaming { spirc, device_name: name, tap, task: Some(task) })
+    Ok(Streaming { spirc, device_name: name, device_id, tap, task: Some(task) })
 }
 
 #[cfg(test)]

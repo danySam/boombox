@@ -68,10 +68,15 @@ pub struct Daemon {
     /// Spotify saying this device is playing while no audio reaches it.
     #[cfg(feature = "streaming")]
     stall: Arc<RwLock<crate::stall::StallWatch>>,
-    /// The name this machine's Connect device registers under, to tell
-    /// "playing here" from playing anywhere else.
+    /// The name this machine's Connect device registers under. For saying
+    /// which device a log line is about, and nothing else.
     #[cfg(feature = "streaming")]
     device_name: String,
+    /// The id Spotify knows our Connect device by, while one is registered.
+    /// What "playing here" and adopting are decided on, because a name can
+    /// belong to two machines and this cannot.
+    #[cfg(feature = "streaming")]
+    device_id: Arc<RwLock<Option<String>>>,
 }
 
 #[derive(Default)]
@@ -146,6 +151,8 @@ pub async fn run(config: &Config) -> Result<()> {
         stall: Arc::new(RwLock::new(crate::stall::StallWatch::default())),
         #[cfg(feature = "streaming")]
         device_name: crate::streaming::device_name(config),
+        #[cfg(feature = "streaming")]
+        device_id: Arc::new(RwLock::new(None)),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -411,6 +418,7 @@ async fn supervise_streaming(
                     tracing::info!("reconnected as {}", handle.device_name());
                 }
                 *daemon.spectrum.write().await = Some(handle.tap());
+                *daemon.device_id.write().await = Some(handle.device_id().to_string());
                 *daemon.streaming_state.write().await = StreamingState::Live;
                 backoff = RECONNECT_FIRST;
 
@@ -420,9 +428,10 @@ async fn supervise_streaming(
                 // is what made the TUI slow to appear.
                 tokio::spawn({
                     let daemon = Arc::clone(daemon);
+                    let id = handle.device_id().to_string();
                     let name = handle.device_name().to_string();
                     let adopt = config.daemon.adopt_playback;
-                    async move { daemon.adopt_if_idle(&name, adopt).await }
+                    async move { daemon.adopt_if_idle(&id, &name, adopt).await }
                 });
 
                 tokio::select! {
@@ -430,11 +439,16 @@ async fn supervise_streaming(
                         *daemon.streaming_state.write().await =
                             StreamingState::Unavailable("the session ended; reconnecting".into());
                         *daemon.spectrum.write().await = None;
+                        // The next session registers a new id, and until it
+                        // does we have no device: an id left behind here
+                        // would be another machine's to match.
+                        *daemon.device_id.write().await = None;
                         tracing::warn!("Connect session ended; reconnecting");
                     }
                     _ = shutdown.changed() => {
                         handle.shutdown();
                         *daemon.streaming_state.write().await = StreamingState::Disabled;
+                        *daemon.device_id.write().await = None;
                         return;
                     }
                 }
@@ -792,8 +806,12 @@ impl Daemon {
     /// handle is not the same as Spotify having listed it -- the first
     /// attempt reliably finds nothing. This runs in the background, so the
     /// wait costs no one anything.
+    ///
+    /// Found by id: matching on the name would let a second machine called
+    /// the same thing be adopted instead, moving playback to the wrong
+    /// computer. The name is only for saying what happened.
     #[cfg(feature = "streaming")]
-    async fn adopt_if_idle(&self, device_name: &str, enabled: bool) {
+    async fn adopt_if_idle(&self, device_id: &str, device_name: &str, enabled: bool) {
         if !enabled {
             return;
         }
@@ -812,7 +830,7 @@ impl Daemon {
             }
 
             if let Ok(devices) = self.client.devices().await
-                && let Some(device) = devices.iter().find(|d| d.name == device_name)
+                && let Some(device) = devices.iter().find(|d| d.id.as_deref() == Some(device_id))
                 && let Some(id) = device.id.as_deref()
             {
                 match self.client.transfer(id, false).await {
@@ -843,7 +861,8 @@ impl Daemon {
     async fn watch_for_silence(&self, state: Option<&PlaybackState>) {
         use crate::stall::{Change, playing_here};
         let tap = self.spectrum.read().await.clone();
-        let here = tap.is_some() && playing_here(state, &self.device_name);
+        let device_id = self.device_id.read().await.clone();
+        let here = tap.is_some() && playing_here(state, device_id.as_deref());
         let since_audio = tap.map(|t| t.since_audio()).unwrap_or_default();
         let name = &self.device_name;
         match self.stall.write().await.observe(here, since_audio, Instant::now()) {
@@ -1416,6 +1435,8 @@ mod tests {
             stall: Arc::new(RwLock::new(crate::stall::StallWatch::default())),
             #[cfg(feature = "streaming")]
             device_name: "boombox".into(),
+            #[cfg(feature = "streaming")]
+            device_id: Arc::new(RwLock::new(None)),
         }
     }
 
