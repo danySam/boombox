@@ -111,6 +111,12 @@ fn startup_notice(startup: &crate::daemon::Startup) -> Option<String> {
         Startup::Unstuck(pid) => {
             Some(format!("the daemon (pid {pid}) had stopped answering, so it was replaced"))
         }
+        Startup::Updated => Some("updated the daemon to this build".to_string()),
+        Startup::DaemonOlder(theirs) => Some(format!(
+            "the daemon is {theirs} and this is {}; it is playing, so it was left alone \
+             (`boombox daemon --stop` when you are done)",
+            boombox_core::build_info::short()
+        )),
         Startup::Unavailable(_) => None,
     }
 }

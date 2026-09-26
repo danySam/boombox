@@ -161,6 +161,70 @@ fn projected_position(pending: &Pending<u64>, playing: bool, now: Instant) -> u6
     pending.wanted().saturating_add(travelled)
 }
 
+/// Whether the daemon's own Connect device is the one currently playing.
+///
+/// Anything playing elsewhere -- a phone, the desktop app -- is untouched
+/// by restarting the daemon, which only proxies for those.
+async fn playing_on(client: &IpcClient, status: &DaemonStatus) -> bool {
+    let Some(ours) = status.device_id.as_deref() else {
+        return false;
+    };
+    match client.playback_state().await {
+        Ok(Some(state)) => {
+            state.is_playing && state.device.as_ref().and_then(|d| d.id.as_deref()) == Some(ours)
+        }
+        _ => false,
+    }
+}
+
+/// The build number out of a version string like `0.1.0 #18 (9e18f3cca)`.
+///
+/// `None` for a build made outside a git checkout, which carries no
+/// number at all -- two of those cannot be ordered, so they are never
+/// treated as one being newer.
+fn build_number(version: &str) -> Option<u64> {
+    let after_hash = version.split('#').nth(1)?;
+    let digits: String = after_hash.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// What to do about a daemon running a different build from this binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Staleness {
+    /// Same build, older, or not comparable. Nothing to say.
+    UpToDate,
+    /// This binary is newer and the daemon is not making sound, so it can
+    /// be replaced without anyone noticing.
+    Replace,
+    /// This binary is newer, but the daemon is the thing playing. Its
+    /// audio is worth more than its age.
+    Busy,
+}
+
+/// Only ever forward, and only when nothing would be interrupted.
+///
+/// Installing a new binary leaves the old daemon running, so the fixes you
+/// just installed are not the code answering you -- which is confusing in
+/// exactly the way that costs an hour. Restarting is free unless the
+/// daemon is itself the Connect device making sound: librespot mints a
+/// fresh id per process, so a restart takes the device away and brings
+/// back a different one.
+///
+/// Newer rather than merely different, or running an old checkout would
+/// kill a good daemon and replace it with the older code.
+fn staleness(ours: Option<u64>, theirs: Option<u64>, playing_here: bool) -> Staleness {
+    match (ours, theirs) {
+        (Some(ours), Some(theirs)) if ours > theirs => {
+            if playing_here {
+                Staleness::Busy
+            } else {
+                Staleness::Replace
+            }
+        }
+        _ => Staleness::UpToDate,
+    }
+}
+
 /// The same play, aimed at our own Connect device, when there is nowhere
 /// else for it to go.
 ///
@@ -1497,6 +1561,12 @@ pub enum Startup {
     /// ended and a fresh one started. Whatever it was playing is gone, but
     /// nothing could have controlled it anyway.
     Unstuck(u32),
+    /// An older daemon was replaced with this build, at a moment when it
+    /// was playing nothing and no one would notice.
+    Updated,
+    /// An older daemon was left alone because it is the device playing.
+    /// Carries its build, so the notice can say what is running.
+    DaemonOlder(String),
     /// No daemon, and none could be started. The caller falls back to
     /// talking to the Web API directly, which still works.
     Unavailable(String),
@@ -1516,10 +1586,41 @@ pub async fn ensure_running(config: &Config) -> (Option<IpcClient>, Startup) {
 
     match probe(&path).await {
         Probe::Absent => {}
-        // Speaks our dialect: use it, whatever build it is.
+        // Speaks our dialect. Usable whatever build it is -- but if this
+        // binary is newer, the fixes it carries are not the ones running.
         Probe::Answering(status) if status.speaks_our_protocol() => {
             if let Ok(client) = IpcClient::connect(&path).await {
-                return (Some(client), Startup::Joined);
+                let ours = build_number(&boombox_core::build_info::short());
+                let theirs = build_number(&status.version);
+                // Asked only when this binary is newer: the common case is
+                // the same build, and that should cost nothing at all.
+                let stale = match staleness(ours, theirs, false) {
+                    Staleness::UpToDate => Staleness::UpToDate,
+                    _ => staleness(ours, theirs, playing_on(&client, &status).await),
+                };
+                match stale {
+                    Staleness::UpToDate => return (Some(client), Startup::Joined),
+                    Staleness::Busy => {
+                        return (Some(client), Startup::DaemonOlder(status.version.clone()));
+                    }
+                    Staleness::Replace => {
+                        tracing::info!(
+                            daemon = %status.version,
+                            ours = %boombox_core::build_info::short(),
+                            "replacing an older daemon; nothing is playing on it"
+                        );
+                        drop(client);
+                        if stop(config).await.is_ok()
+                            && let Ok(client) = start_and_wait(&path).await
+                        {
+                            return (Some(client), Startup::Updated);
+                        }
+                        // Could not replace it: the old one still works.
+                        if let Ok(client) = IpcClient::connect(&path).await {
+                            return (Some(client), Startup::DaemonOlder(status.version.clone()));
+                        }
+                    }
+                }
             }
         }
         Probe::Answering(status) => {
@@ -1664,6 +1765,44 @@ mod tests {
         let note = idle_streaming_note(&StreamingState::NotSignedIn);
         assert!(note.contains("auth login --streaming"), "{note}");
         assert!(note.contains("Everything else works"), "{note}");
+    }
+
+    #[test]
+    fn a_build_number_is_read_out_of_a_version_string() {
+        assert_eq!(build_number("0.1.0 #18 (9e18f3cca) 2026-09-27"), Some(18));
+        assert_eq!(build_number("0.1.0 #3 (f1e8a9543)"), Some(3));
+        assert_eq!(build_number("0.1.0 #7 (abc123def+)"), Some(7), "a dirty tree still counts");
+    }
+
+    /// A tarball build carries no number, and two of those cannot be put
+    /// in order -- so neither is ever called newer than the other.
+    #[test]
+    fn a_build_without_a_number_is_never_newer() {
+        assert_eq!(build_number("0.1.0 (abc123def)"), None);
+        assert_eq!(build_number("0.1.0"), None);
+        assert_eq!(staleness(None, Some(3), false), Staleness::UpToDate);
+        assert_eq!(staleness(Some(18), None, false), Staleness::UpToDate);
+    }
+
+    /// The point: installing leaves the old daemon running, and the fixes
+    /// just installed are not the code answering.
+    #[test]
+    fn a_newer_binary_replaces_an_idle_daemon() {
+        assert_eq!(staleness(Some(18), Some(3), false), Staleness::Replace);
+    }
+
+    /// Unless it is the one making sound. A restart takes the device away
+    /// and brings back a different one.
+    #[test]
+    fn a_daemon_that_is_playing_is_left_alone() {
+        assert_eq!(staleness(Some(18), Some(3), true), Staleness::Busy);
+    }
+
+    /// Running an old checkout must not replace a newer daemon with it.
+    #[test]
+    fn an_older_binary_never_replaces_a_newer_daemon() {
+        assert_eq!(staleness(Some(3), Some(18), false), Staleness::UpToDate);
+        assert_eq!(staleness(Some(18), Some(18), false), Staleness::UpToDate);
     }
 
     /// The dead end this removes: the device is listed, play fails, and
