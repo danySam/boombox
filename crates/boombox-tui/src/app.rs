@@ -129,6 +129,15 @@ const VOLUME_COALESCE: Duration = Duration::from_millis(220);
 /// number and then jump forward again.
 const VOLUME_SETTLE: Duration = Duration::from_secs(20);
 
+/// How long a seek target stays the base for the next seek key.
+///
+/// Long enough to chain a run of presses: without it each one reads the
+/// same polled position and asks for the same place, so a run of taps
+/// makes a single jump -- the bug volume had. Short enough that a target
+/// from a minute ago never bases a fresh seek, by which time the track
+/// has played on past it.
+const SEEK_CHAIN: Duration = Duration::from_millis(1200);
+
 /// How far out the reported volume may be and still count as agreement.
 /// The device rounds -- ask for 55 and it reads back 54 -- so an exact
 /// match would never arrive.
@@ -421,6 +430,11 @@ pub struct App {
     volume_touched: Instant,
     /// Whether `pending_volume` has been sent yet.
     volume_sent: bool,
+    /// Where the last seek key asked to go, so the next one counts from
+    /// there rather than from a position the API has not caught up to.
+    pending_seek: Option<u64>,
+    /// When that target was set.
+    seek_touched: Instant,
 }
 
 impl App {
@@ -476,6 +490,8 @@ impl App {
             pending_volume: None,
             volume_touched: Instant::now(),
             volume_sent: false,
+            pending_seek: None,
+            seek_touched: Instant::now(),
         }
     }
 
@@ -488,6 +504,9 @@ impl App {
         self.reconcile_volume();
         let changed = previous != self.current_uri();
         if changed {
+            // A target measured against the track that just ended would
+            // otherwise base the next seek in the one that replaced it.
+            self.pending_seek = None;
             self.palette = match self.current_uri() {
                 Some(uri) => Palette::for_uri(&uri),
                 None => Palette::default(),
@@ -712,6 +731,13 @@ impl App {
     #[cfg(test)]
     pub(crate) fn expire_volume_coalesce(&mut self) {
         self.volume_touched = Instant::now() - VOLUME_COALESCE;
+    }
+
+    /// Pretends the seek keys stopped long enough ago that the next one
+    /// starts from the live position again.
+    #[cfg(test)]
+    pub(crate) fn expire_seek_chain(&mut self) {
+        self.seek_touched = Instant::now() - SEEK_CHAIN;
     }
 
     /// Whether a volume change is still in flight -- the user has asked
@@ -1086,13 +1112,24 @@ impl App {
             Action::PreviousTrack => return Some(Command::Previous),
 
             Action::SeekForward | Action::SeekBackward => {
-                let state = self.playback.as_ref()?;
-                let current = state.progress();
+                // Advanced to now, not the figure the last poll carried:
+                // that one is a fraction of a second behind the music.
+                let live = self.playback()?;
+                // Counted from the last target while the keys are still
+                // coming, for the reason volume is: presses inside one
+                // poll interval all read the same position, so they would
+                // all ask for the same place and collapse into one jump.
+                let current = match self.pending_seek {
+                    Some(target) if self.seek_touched.elapsed() < SEEK_CHAIN => target,
+                    _ => live.progress(),
+                };
                 let target = if matches!(action, Action::SeekForward) {
-                    current.saturating_add(self.seek_step_ms).min(state.duration().max(current))
+                    current.saturating_add(self.seek_step_ms).min(live.duration().max(current))
                 } else {
                     current.saturating_sub(self.seek_step_ms)
                 };
+                self.pending_seek = Some(target);
+                self.seek_touched = Instant::now();
                 return Some(Command::Seek(target));
             }
 
@@ -1403,11 +1440,71 @@ pub(crate) mod tests {
         assert_eq!(app.update(Action::NextTrack), Some(Command::Next));
     }
 
+    /// The base is advanced to the moment of the keypress, so the exact
+    /// millisecond depends on how long the test itself took. A step is
+    /// five seconds; a hundred milliseconds of slack cannot hide an error
+    /// that matters.
+    #[track_caller]
+    fn seeks_to(command: Option<Command>, expected: u64) {
+        let Some(Command::Seek(ms)) = command else {
+            panic!("expected a seek, got {command:?}");
+        };
+        assert!(
+            (expected..expected + 100).contains(&ms),
+            "expected about {expected}ms, got {ms}ms"
+        );
+    }
+
+    /// The same bug volume had, in the other axis: every press read the
+    /// position the last poll carried, so a run of them all asked to go to
+    /// the same place and arrived as one jump.
+    #[test]
+    fn a_run_of_seeks_accumulates_instead_of_collapsing() {
+        let mut app = app_with_state(playing_state(50, false, true));
+        seeks_to(app.update(Action::SeekForward), 65_000);
+        seeks_to(app.update(Action::SeekForward), 70_000);
+        seeks_to(app.update(Action::SeekForward), 75_000);
+    }
+
+    /// Going back undoes going forward, rather than landing a step behind
+    /// where it started.
+    #[test]
+    fn a_seek_back_undoes_a_seek_forward() {
+        let mut app = app_with_state(playing_state(50, false, true));
+        seeks_to(app.update(Action::SeekForward), 65_000);
+        seeks_to(app.update(Action::SeekBackward), 60_000);
+    }
+
+    /// Chaining is for a run of presses. A target from a minute ago is not
+    /// where the track is any more, so the next seek starts from the music.
+    #[test]
+    fn a_seek_after_a_gap_starts_from_the_live_position() {
+        let mut app = app_with_state(playing_state(50, false, true));
+        seeks_to(app.update(Action::SeekForward), 65_000);
+        app.expire_seek_chain();
+        seeks_to(app.update(Action::SeekForward), 65_000);
+    }
+
+    /// A target belongs to the track it was measured in.
+    #[test]
+    fn a_new_track_drops_the_chained_target() {
+        let mut app = app_with_state(playing_state(50, false, true));
+        seeks_to(app.update(Action::SeekForward), 65_000);
+        app.set_playback(Some(
+            serde_json::from_str(
+                r#"{"is_playing":true,"progress_ms":10000,
+                "item":{"type":"track","name":"next","uri":"spotify:track:next",
+                        "duration_ms":200000,"artists":[],"album":{}}}"#,
+            )
+            .unwrap(),
+        ));
+        seeks_to(app.update(Action::SeekForward), 15_000);
+    }
+
     #[test]
     fn seek_uses_the_configured_step_and_clamps() {
         let mut app = app_with_state(playing_state(50, false, true));
-        assert_eq!(app.update(Action::SeekForward), Some(Command::Seek(65_000)));
-        assert_eq!(app.update(Action::SeekBackward), Some(Command::Seek(55_000)));
+        seeks_to(app.update(Action::SeekForward), 65_000);
 
         let mut app = App::new(5, false);
         app.set_playback(Some(
@@ -1419,6 +1516,17 @@ pub(crate) mod tests {
             .unwrap(),
         ));
         assert_eq!(app.update(Action::SeekBackward), Some(Command::Seek(0)), "cannot go negative");
+    }
+
+    /// The end of the track is the end of the seek, however many presses
+    /// are chained past it.
+    #[test]
+    fn a_run_of_seeks_stops_at_the_end_of_the_track() {
+        let mut app = app_with_state(playing_state(50, false, true));
+        for _ in 0..60 {
+            app.update(Action::SeekForward);
+        }
+        seeks_to(app.update(Action::SeekForward), 200_000);
     }
 
     /// The reported bug: eight rapid presses moved the volume by one step,
