@@ -335,6 +335,8 @@ enabled = true
 # machine>", so two computers running boombox stay tellable apart.
 # device_name = "boombox"
 bitrate = 320
+# Only for the first run: after that the volume you last set is remembered
+# and restored, so turning it down survives a restart.
 initial_volume = 50
 normalisation = false
 "#;

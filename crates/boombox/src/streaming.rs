@@ -82,6 +82,19 @@ pub async fn authorize(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// The volume a new session should come up at.
+///
+/// librespot saves the volume to its cache on every change but never
+/// reads it back: `ConnectState::new` takes whatever `initial_volume`
+/// says, so the figure it carefully remembered was overwritten by the
+/// configured one at every session start. The last volume actually set
+/// is the better answer -- someone who turned it down last night did not
+/// mean "until the daemon restarts" -- so the configured value becomes
+/// the seed for a first run rather than a reset for every run.
+fn starting_volume(cached: Option<u16>, configured: u16) -> u16 {
+    cached.unwrap_or(configured)
+}
+
 /// The name this machine's Connect device registers under.
 ///
 /// A configured name is used exactly as written. Otherwise it is built from
@@ -278,6 +291,9 @@ pub async fn start(config: &Config) -> Result<Streaming> {
     // A Session is an Arc inside, so this is a handle to the same one Spirc
     // is about to take, kept so its liveness can be watched.
     let watched = session.clone();
+    // Read before Spirc takes the session: librespot writes this on every
+    // volume change and then ignores it on the way back up.
+    let remembered_volume = session.cache().and_then(|cache| cache.volume());
 
     let player_config = PlayerConfig {
         bitrate: bitrate_from(settings.bitrate)?,
@@ -307,7 +323,7 @@ pub async fn start(config: &Config) -> Result<Streaming> {
         // Computer rather than Speaker: this is a machine you sit at, and the
         // icon in the picker should say so.
         device_type: DeviceType::Computer,
-        initial_volume: settings.initial_volume_u16(),
+        initial_volume: starting_volume(remembered_volume, settings.initial_volume_u16()),
         ..ConnectConfig::default()
     };
 
@@ -356,6 +372,25 @@ mod tests {
         )
         .await;
         assert!(waited.is_err(), "it must still be waiting");
+    }
+
+    /// The volume librespot wrote down last time beats the configured
+    /// seed, or turning it down would last only until the next restart.
+    #[test]
+    fn the_last_volume_set_is_the_one_that_comes_back() {
+        assert_eq!(starting_volume(Some(12_000), 32_767), 12_000);
+    }
+
+    /// Nothing remembered -- a first run -- falls back to the config.
+    #[test]
+    fn with_nothing_remembered_the_configured_volume_is_used() {
+        assert_eq!(starting_volume(None, 32_767), 32_767);
+    }
+
+    /// Silence is a real choice, and must survive a restart like any other.
+    #[test]
+    fn a_volume_of_zero_is_remembered_rather_than_treated_as_absent() {
+        assert_eq!(starting_volume(Some(0), 32_767), 0);
     }
 
     /// Two machines with one name each, rather than two rows both called
