@@ -27,7 +27,20 @@ release-streaming:
 install:
 	cargo install --locked --path crates/boombox --features streaming --force
 	@./scripts/codesign.sh "$$HOME/.cargo/bin/boombox"
-	@echo "installed $$(command -v boombox)"
+	@echo "installed $$("$$HOME/.cargo/bin/boombox" --version)"
+	@echo "          $$HOME/.cargo/bin/boombox"
+# Another boombox earlier on PATH would shadow the one just installed, and
+# every later command would quietly be the old one.
+	@found=$$(command -v boombox 2>/dev/null || true); \
+	  if [ -n "$$found" ] && [ "$$found" != "$$HOME/.cargo/bin/boombox" ]; then \
+	    echo "warning:  PATH finds $$found first"; \
+	  fi
+# A daemon keeps the build it started with, however many times this runs.
+	@if "$$HOME/.cargo/bin/boombox" daemon --status >/dev/null 2>&1; then \
+	  running=$$("$$HOME/.cargo/bin/boombox" daemon --status | awk '/^version/ {$$1=""; print substr($$0, 2)}'); \
+	  echo "note:     the running daemon is still $$running"; \
+	  echo "          \`boombox daemon --stop\` replaces it"; \
+	fi
 
 run: build
 	./target/debug/boombox
