@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
-use boombox_core::api::PlaybackState;
 use boombox_core::api::library::LibraryApi;
 use boombox_core::api::player::PlayerApi;
+use boombox_core::api::{Pendings, PlaybackState};
+use boombox_core::intent::Pending;
 use boombox_core::{Client, Config, Error};
 use boombox_ipc::protocol::{PROTOCOL_VERSION, StreamingState};
 use boombox_ipc::{DaemonStatus, IpcClient, Request, Response, WireError};
@@ -27,6 +28,25 @@ const ENVELOPE_BUCKETS: usize = 600;
 /// lock and a float compare.
 #[cfg(feature = "streaming")]
 const ENVELOPE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a written value is shown in place of the reported one, when
+/// the player never comes to agree with it.
+///
+/// Measured against the real thing: a volume change takes about eleven
+/// seconds to appear in the API, so anything shorter makes the figure snap
+/// back to a stale reading and then jump forward again. Pausing and
+/// seeking land within a poll or two, so they give up sooner.
+const VOLUME_SETTLE: Duration = Duration::from_secs(20);
+const POSITION_SETTLE: Duration = Duration::from_secs(10);
+const PLAYING_SETTLE: Duration = Duration::from_secs(8);
+
+/// Devices round a volume -- ask for 55 and it reads back 54 -- so an
+/// exact match would never arrive.
+const VOLUME_TOLERANCE: u32 = 2;
+
+/// A position is never reported exactly: the track has played on between
+/// the write landing and the poll observing it.
+const POSITION_TOLERANCE_MS: u64 = 2_500;
 
 /// How often to resolve one outstanding context name. Slow on purpose:
 /// nothing is waiting on it, and the list settles within a minute.
@@ -83,6 +103,136 @@ pub struct Daemon {
 struct Cache {
     playback: Option<PlaybackState>,
     fetched_at: Option<Instant>,
+    /// Kept beside the state it overrides, under the same lock, so a read
+    /// can never catch one without the other.
+    intents: Intents,
+}
+
+/// What has been asked for and not yet confirmed.
+///
+/// Spotify reports a write seconds after applying it, and the poll the
+/// daemon fires straight after writing is the one most likely to still
+/// carry the old value. Without this, every command the user gives is
+/// answered with the state it was meant to change.
+#[derive(Default)]
+struct Intents {
+    volume: Option<Pending<u32>>,
+    position: Option<Pending<u64>>,
+    playing: Option<Pending<bool>>,
+}
+
+fn volume_agrees(wanted: u32, seen: u32) -> bool {
+    wanted.abs_diff(seen) <= VOLUME_TOLERANCE
+}
+
+impl Intents {
+    /// Drops whatever the player has now agreed with, or waited out.
+    fn settle_against(&mut self, observed: Option<&PlaybackState>, now: Instant) {
+        let playing_now = observed.is_some_and(|s| s.is_playing);
+        self.volume =
+            self.volume.filter(|p| p.holds(observed.and_then(|s| s.volume()), volume_agrees, now));
+        self.position = self.position.filter(|p| {
+            // Compared against where the asked-for position has travelled
+            // to, not where it started: a track seeked two seconds ago is
+            // two seconds further on, and that is agreement, not drift.
+            let projected = projected_position(p, playing_now, now);
+            p.holds(
+                observed.and_then(|s| s.progress_ms),
+                |_, seen| projected.abs_diff(seen) <= POSITION_TOLERANCE_MS,
+                now,
+            )
+        });
+        self.playing =
+            self.playing.filter(|p| p.holds(observed.map(|s| s.is_playing), |a, b| a == b, now));
+    }
+}
+
+/// Replaces an outstanding value, or starts holding one.
+fn renew<T: Copy>(slot: &mut Option<Pending<T>>, wanted: T, settle: Duration, now: Instant) {
+    match slot {
+        Some(pending) => pending.renew(wanted, now),
+        None => *slot = Some(Pending::at(wanted, settle, now)),
+    }
+}
+
+/// Where a position asked for at some point in the past has reached by now.
+fn projected_position(pending: &Pending<u64>, playing: bool, now: Instant) -> u64 {
+    let travelled = if playing { pending.age(now).as_millis() as u64 } else { 0 };
+    pending.wanted().saturating_add(travelled)
+}
+
+/// What a write means for the state being held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wrote {
+    Volume(u32),
+    Position(u64),
+    Playing(bool),
+    /// A different track: any position asked for belongs to the one being
+    /// left behind.
+    Track,
+}
+
+fn wrote(request: &Request) -> Option<Wrote> {
+    match request {
+        Request::SetVolume { percent } => Some(Wrote::Volume(*percent)),
+        Request::Seek { position_ms } => Some(Wrote::Position(*position_ms)),
+        Request::Pause => Some(Wrote::Playing(false)),
+        Request::Play(_) => Some(Wrote::Playing(true)),
+        Request::Next | Request::Previous => Some(Wrote::Track),
+        _ => None,
+    }
+}
+
+/// The cached state with anything outstanding shown in its place.
+fn overlay(
+    polled: &PlaybackState,
+    intents: &Intents,
+    since_poll: Duration,
+    now: Instant,
+) -> PlaybackState {
+    let mut state = polled.clone();
+    let mut pending = Pendings::default();
+
+    // First, because it decides whether the clock below runs at all.
+    if let Some(p) = &intents.playing
+        && p.holds(Some(polled.is_playing), |a, b| a == b, now)
+    {
+        state.is_playing = p.wanted();
+        pending.playing = true;
+    }
+
+    match &intents.position {
+        Some(p)
+            if p.holds(
+                polled.progress_ms,
+                |_, seen| {
+                    projected_position(p, state.is_playing, now).abs_diff(seen)
+                        <= POSITION_TOLERANCE_MS
+                },
+                now,
+            ) =>
+        {
+            // Advanced from when it was asked for, not from the last poll:
+            // the seek happened after that poll, not before it.
+            let target = projected_position(p, state.is_playing, now);
+            let duration = state.duration();
+            state.progress_ms = Some(if duration > 0 { target.min(duration) } else { target });
+            pending.position = true;
+        }
+        // Nothing outstanding: the ordinary smooth clock between polls.
+        _ => state = state.advanced_by(since_poll),
+    }
+
+    if let Some(p) = &intents.volume
+        && p.holds(polled.volume(), volume_agrees, now)
+        && let Some(device) = state.device.as_mut()
+    {
+        device.volume_percent = Some(p.wanted());
+        pending.volume = true;
+    }
+
+    state.pending = pending;
+    state
 }
 
 #[derive(Default)]
@@ -586,8 +736,20 @@ impl Daemon {
         self.watch_for_silence(state.as_ref()).await;
 
         let mut cache = self.cache.write().await;
+        let now = Instant::now();
+        let track_changed = {
+            let was = cache.playback.as_ref().and_then(|s| s.item.as_ref()).and_then(|i| i.uri());
+            let is = state.as_ref().and_then(|s| s.item.as_ref()).and_then(|i| i.uri());
+            was != is
+        };
+        if track_changed {
+            // A position asked for in the track that ended says nothing
+            // about the one that replaced it.
+            cache.intents.position = None;
+        }
+        cache.intents.settle_against(state.as_ref(), now);
         cache.playback = state;
-        cache.fetched_at = Some(Instant::now());
+        cache.fetched_at = Some(now);
         Ok(is_playing)
     }
 
@@ -596,8 +758,23 @@ impl Daemon {
     async fn cached_playback(&self) -> Option<PlaybackState> {
         let cache = self.cache.read().await;
         let state = cache.playback.as_ref()?;
-        let elapsed = cache.fetched_at.map(|t| t.elapsed()).unwrap_or_default();
-        Some(state.advanced_by(elapsed))
+        let now = Instant::now();
+        let elapsed =
+            cache.fetched_at.map(|t| now.saturating_duration_since(t)).unwrap_or_default();
+        Some(overlay(state, &cache.intents, elapsed, now))
+    }
+
+    /// Holds what a write asked for until the player reports it.
+    async fn remember(&self, what: Wrote) {
+        let now = Instant::now();
+        let mut cache = self.cache.write().await;
+        match what {
+            Wrote::Volume(percent) => renew(&mut cache.intents.volume, percent, VOLUME_SETTLE, now),
+            Wrote::Position(ms) => renew(&mut cache.intents.position, ms, POSITION_SETTLE, now),
+            Wrote::Playing(on) => renew(&mut cache.intents.playing, on, PLAYING_SETTLE, now),
+            // Skipping abandons a position rather than asking for one.
+            Wrote::Track => cache.intents.position = None,
+        }
     }
 
     async fn serve(&self, stream: UnixStream, shutdown_tx: &watch::Sender<bool>) -> Result<()> {
@@ -667,8 +844,16 @@ impl Daemon {
             _ => {}
         }
 
+        let recorded = wrote(&request);
         let response = match self.forward(request).await {
-            Ok(response) => response,
+            Ok(response) => {
+                // Only once the write is accepted. A change Spotify refused
+                // must not be shown as though it had worked.
+                if let Some(what) = recorded {
+                    self.remember(what).await;
+                }
+                response
+            }
             Err(e) => Response::Error(WireError::from(&e)),
         };
         (response, false)
@@ -1410,6 +1595,100 @@ mod tests {
         let note = idle_streaming_note(&StreamingState::NotSignedIn);
         assert!(note.contains("auth login --streaming"), "{note}");
         assert!(note.contains("Everything else works"), "{note}");
+    }
+
+    const POLLED: &str = r#"{"is_playing":true,"progress_ms":60000,
+        "device":{"id":"d","name":"Desk","type":"Computer","volume_percent":40},
+        "item":{"type":"track","name":"x","uri":"spotify:track:x","duration_ms":200000,
+                "artists":[],"album":{}}}"#;
+
+    fn polled_state() -> PlaybackState {
+        serde_json::from_str(POLLED).unwrap()
+    }
+
+    /// The whole point: the figure asked for is the one shown, until the
+    /// player catches up. Without this the display answers with the value
+    /// the keypress was meant to change.
+    #[test]
+    fn a_written_volume_is_shown_until_the_player_agrees() {
+        let t0 = Instant::now();
+        let intents =
+            Intents { volume: Some(Pending::at(70, VOLUME_SETTLE, t0)), ..Intents::default() };
+        let shown = overlay(&polled_state(), &intents, Duration::ZERO, t0 + Duration::from_secs(1));
+        assert_eq!(shown.volume(), Some(70), "the player still says 40");
+        assert!(shown.pending.volume, "and the reader is told it is not confirmed");
+
+        let mut agreed = polled_state();
+        agreed.device.as_mut().unwrap().volume_percent = Some(70);
+        let shown = overlay(&agreed, &intents, Duration::ZERO, t0 + Duration::from_secs(1));
+        assert_eq!(shown.volume(), Some(70));
+        assert!(!shown.pending.volume, "the player agrees, so nothing is outstanding");
+    }
+
+    /// Pausing has to stop the clock as well as the glyph, or the timer
+    /// runs on under a player that is not playing.
+    #[test]
+    fn a_pause_stops_the_clock_before_spotify_reports_it() {
+        let t0 = Instant::now();
+        let intents =
+            Intents { playing: Some(Pending::at(false, PLAYING_SETTLE, t0)), ..Intents::default() };
+        let shown =
+            overlay(&polled_state(), &intents, Duration::from_secs(5), t0 + Duration::from_secs(5));
+        assert!(!shown.is_playing);
+        assert!(shown.pending.playing);
+        assert_eq!(shown.progress_ms, Some(60_000), "not advanced by the five seconds");
+    }
+
+    /// A position does not stay where it was put: the seek happened after
+    /// the last poll, so it advances from the keypress, not from the poll.
+    #[test]
+    fn a_seek_is_shown_from_where_it_was_asked_for() {
+        let t0 = Instant::now();
+        let intents = Intents {
+            position: Some(Pending::at(65_000, POSITION_SETTLE, t0)),
+            ..Intents::default()
+        };
+        let shown =
+            overlay(&polled_state(), &intents, Duration::from_secs(9), t0 + Duration::from_secs(2));
+        assert_eq!(shown.progress_ms, Some(67_000), "65s asked for, two seconds ago");
+        assert!(shown.pending.position);
+    }
+
+    /// The backstop. A change that never lands must not be shown for ever.
+    #[test]
+    fn a_value_the_player_never_confirms_is_given_up() {
+        let t0 = Instant::now();
+        let intents =
+            Intents { volume: Some(Pending::at(70, VOLUME_SETTLE, t0)), ..Intents::default() };
+        let shown = overlay(&polled_state(), &intents, Duration::ZERO, t0 + VOLUME_SETTLE);
+        assert_eq!(shown.volume(), Some(40), "back to what the player reports");
+        assert!(!shown.pending.any());
+    }
+
+    #[test]
+    fn a_poll_that_agrees_clears_what_was_outstanding() {
+        let t0 = Instant::now();
+        let mut intents = Intents {
+            volume: Some(Pending::at(70, VOLUME_SETTLE, t0)),
+            playing: Some(Pending::at(true, PLAYING_SETTLE, t0)),
+            ..Intents::default()
+        };
+        let mut observed = polled_state();
+        observed.device.as_mut().unwrap().volume_percent = Some(69);
+        intents.settle_against(Some(&observed), t0 + Duration::from_secs(1));
+        assert!(intents.volume.is_none(), "69 is within rounding of 70");
+        assert!(intents.playing.is_none(), "the player is playing, as asked");
+    }
+
+    /// Reads change nothing, so they leave nothing behind.
+    #[test]
+    fn only_writes_are_remembered() {
+        assert_eq!(wrote(&Request::SetVolume { percent: 70 }), Some(Wrote::Volume(70)));
+        assert_eq!(wrote(&Request::Seek { position_ms: 1000 }), Some(Wrote::Position(1000)));
+        assert_eq!(wrote(&Request::Pause), Some(Wrote::Playing(false)));
+        assert_eq!(wrote(&Request::Next), Some(Wrote::Track));
+        assert_eq!(wrote(&Request::PlaybackState), None);
+        assert_eq!(wrote(&Request::Devices), None);
     }
 
     /// handling that does not touch the network.

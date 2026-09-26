@@ -468,6 +468,9 @@ fn as_json(state: &PlaybackState) -> serde_json::Value {
         "shuffle": state.shuffle_state,
         "repeat": state.repeat_state,
         "context": state.context.as_ref().map(|c| c.uri.clone()),
+        // True while a change of ours has not come back from Spotify yet,
+        // so a script can tell "what was asked for" from "what is so".
+        "pending": state.pending.any(),
     })
 }
 

@@ -51,6 +51,14 @@ impl<T: Copy> Pending<T> {
         self.since = now;
     }
 
+    /// How long ago this was asked for.
+    ///
+    /// A position does not stay where it was put: asked for two seconds
+    /// ago, it is two seconds further on by now if the track is playing.
+    pub fn age(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.since)
+    }
+
     /// Whether the wait is over, whatever was observed.
     pub fn expired(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.since) >= self.settle
@@ -127,6 +135,16 @@ mod tests {
         let pending = Pending::at(70, SETTLE, t0);
         assert!(pending.holds(None, EXACT, t0 + secs(1)));
         assert!(!pending.holds(None, EXACT, t0 + secs(11)), "but the wait still runs out");
+    }
+
+    /// A position keeps moving after it is asked for, so the caller needs
+    /// to know how long it has been travelling.
+    #[test]
+    fn it_reports_how_long_ago_it_was_asked_for() {
+        let t0 = Instant::now();
+        let pending = Pending::at(70, SETTLE, t0);
+        assert_eq!(pending.age(t0 + secs(3)), secs(3));
+        assert_eq!(pending.age(t0), Duration::ZERO);
     }
 
     /// Holding a key down must not let the wait expire underneath it.

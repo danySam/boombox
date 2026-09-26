@@ -2,6 +2,29 @@ use serde::{Deserialize, Serialize};
 
 use super::models::Image;
 
+/// Which parts of a state are what someone asked for rather than what the
+/// player has reported yet.
+///
+/// Set by the daemon, which holds a write in front of the truth until the
+/// truth catches up. Spotify never sends this, so it defaults to nothing
+/// pending and a state read straight from the API is honest by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pendings {
+    #[serde(default)]
+    pub volume: bool,
+    #[serde(default)]
+    pub position: bool,
+    #[serde(default)]
+    pub playing: bool,
+}
+
+impl Pendings {
+    /// Whether anything at all is waiting on the player to agree.
+    pub fn any(&self) -> bool {
+        self.volume || self.position || self.playing
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybackState {
     pub device: Option<Device>,
@@ -15,6 +38,9 @@ pub struct PlaybackState {
     pub is_playing: bool,
     pub item: Option<PlayingItem>,
     pub context: Option<Context>,
+    /// Which of the values above are still waiting to be confirmed.
+    #[serde(default)]
+    pub pending: Pendings,
 }
 
 impl PlaybackState {

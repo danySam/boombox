@@ -18,7 +18,9 @@ pub use library_models::{
 };
 pub use models::CurrentUser;
 pub use player::{Offset, PlayOptions, Playback, PlayerApi, SpectrumApi};
-pub use player_models::{Device, Devices, PlaybackState, PlayingItem, Queue, RepeatState, Track};
+pub use player_models::{
+    Device, Devices, Pendings, PlaybackState, PlayingItem, Queue, RepeatState, Track,
+};
 
 pub const API_BASE: &str = "https://api.spotify.com/v1";
 
