@@ -1148,6 +1148,7 @@ impl Daemon {
 
     async fn status(&self) -> DaemonStatus {
         let audio_stalled_secs = self.audio_stalled_secs().await;
+        let device_id = self.our_device().await;
         let streaming_state = self.streaming_state.read().await.clone();
         let cache = self.cache.read().await;
         DaemonStatus {
@@ -1155,6 +1156,7 @@ impl Daemon {
             version: boombox_core::build_info::short(),
             streaming: streaming_state == StreamingState::Live,
             streaming_state: Some(streaming_state),
+            device_id,
             pid: std::process::id(),
             uptime_secs: self.started.elapsed().as_secs(),
             requests_served: self.stats.requests.load(Ordering::Relaxed),

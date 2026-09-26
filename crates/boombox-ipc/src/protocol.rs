@@ -241,6 +241,13 @@ pub struct DaemonStatus {
     /// still answers a ping; `streaming` alone is the fallback.
     #[serde(default)]
     pub streaming_state: Option<StreamingState>,
+    /// The Connect device the daemon registered, when it has one.
+    ///
+    /// How a front end tells which row in the device list is this machine.
+    /// The name cannot answer that: any device can be renamed to anything,
+    /// including the name of another.
+    #[serde(default)]
+    pub device_id: Option<String>,
     pub pid: u32,
     pub uptime_secs: u64,
     pub requests_served: u64,
@@ -455,6 +462,7 @@ mod tests {
             version: "0.1.0 (abc123def)".into(),
             streaming: true,
             streaming_state: Some(StreamingState::Live),
+            device_id: None,
             audio_stalled_secs: None,
             pid: 1,
             uptime_secs: 0,

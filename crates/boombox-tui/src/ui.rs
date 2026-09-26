@@ -781,6 +781,12 @@ fn devices(frame: &mut Frame, area: Rect, app: &App) {
                 (true, Some(v)) => format!("{v}%"),
                 _ => "\u{2014}".into(),
             };
+            // The dot already means "active", which is a different
+            // question from "is this the machine I am sitting at".
+            let here = match (&app.our_device_id, &d.id) {
+                (Some(ours), Some(id)) if ours == id => "  \u{b7} here",
+                _ => "",
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(
                     if d.is_active { " \u{25cf} " } else { " \u{25cb} " },
@@ -788,6 +794,7 @@ fn devices(frame: &mut Frame, area: Rect, app: &App) {
                 ),
                 Span::raw(format!("{:width$}  ", d.name, width = width)),
                 Span::styled(format!("{:10} {volume}", d.device_type), Style::new().fg(DIM)),
+                Span::styled(here, Style::new().fg(ACCENT)),
             ]))
         })
         .collect();
@@ -2278,6 +2285,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The dot answers "is this playing". This answers "is this the
+    /// machine I am sitting at", which is a different question -- and one
+    /// the name cannot settle, since a device can be called anything.
+    #[test]
+    fn the_device_list_says_which_one_is_here() {
+        let mut app = App::new(5, true);
+        app.view = crate::app::View::Devices;
+        app.browse_open = true;
+        app.set_devices(vec![
+            crate::app::tests::device("studio"),
+            crate::app::tests::device("kitchen"),
+        ]);
+        app.our_device_id = Some("id-studio".into());
+
+        let text = render(&app, 110, 14);
+        let row =
+            |name: &str| text.lines().find(|l| l.contains(name)).unwrap_or_default().to_string();
+        assert!(row("studio").contains("here"), "ours is marked: {}", row("studio"));
+        assert!(!row("kitchen").contains("here"), "theirs is not: {}", row("kitchen"));
+    }
+
+    /// Without a daemon there is no device of ours, so nothing is marked
+    /// rather than something being marked wrongly.
+    #[test]
+    fn nothing_is_marked_here_without_a_daemon() {
+        let mut app = App::new(5, false);
+        app.view = crate::app::View::Devices;
+        app.browse_open = true;
+        app.set_devices(vec![crate::app::tests::device("studio")]);
+
+        let text = render(&app, 110, 14);
+        assert!(!text.contains("here"), "{text}");
     }
 
     /// Narrow terminals lose the words rather than the state.

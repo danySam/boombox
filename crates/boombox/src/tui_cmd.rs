@@ -42,6 +42,8 @@ pub async fn run(direct: bool) -> Result<()> {
             let status = crate::daemon::daemon_status(&config).await;
             tracing::debug!(ms = t1.elapsed().as_millis(), "phase: daemon_status");
             let mismatch = status.as_ref().and_then(|s| s.mismatch_warning());
+            // Taken before the version moves out of `status` below.
+            let our_device_id = status.as_ref().and_then(|s| s.device_id.clone());
 
             // Adopting is worth reporting: it changes where sound comes
             // from, which the user did not explicitly ask for.
@@ -62,6 +64,7 @@ pub async fn run(direct: bool) -> Result<()> {
                     seek_step_secs,
                     connected_to_daemon: true,
                     daemon_version: status.map(|s| s.version).filter(|v| !v.is_empty()),
+                    our_device_id,
                     daemon_warning: mismatch,
                     daemon_notice: notice,
                     graphics: graphics.clone(),
@@ -84,6 +87,8 @@ pub async fn run(direct: bool) -> Result<()> {
             seek_step_secs,
             connected_to_daemon: false,
             daemon_version: None,
+            // Without a daemon there is no device of ours to point at.
+            our_device_id: None,
             daemon_warning: None,
             daemon_notice: None,
             graphics,

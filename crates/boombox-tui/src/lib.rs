@@ -88,6 +88,9 @@ pub struct Options {
     pub connected_to_daemon: bool,
     /// Build string of the daemon on the other end, when there is one.
     pub daemon_version: Option<String>,
+    /// The Connect device the daemon registered, so the device list can
+    /// say which row is this machine.
+    pub our_device_id: Option<String>,
     /// Raised at startup when the daemon speaks a different protocol, so the
     /// skew is visible before it breaks a request rather than after.
     pub daemon_warning: Option<String>,
@@ -130,6 +133,7 @@ where
     app.graphics = crate::graphics::Protocol::detect(&options.graphics).usable();
     tracing::info!(protocol = ?app.graphics, "album art");
     app.daemon_version = options.daemon_version.clone();
+    app.our_device_id = options.our_device_id.clone();
     // Surfaced immediately rather than left for the first request that
     // happens to hit a changed message, which is a baffling way to find out.
     // A real warning wins the one toast slot over a mere notice.

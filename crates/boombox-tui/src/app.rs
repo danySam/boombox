@@ -441,6 +441,9 @@ pub struct App {
     /// "which build is actually running?" can be answered without leaving
     /// the TUI -- the daemon outlives the binary that started it.
     pub daemon_version: Option<String>,
+    /// The Connect device this machine's daemon registered, when there is
+    /// one. Matched by id: a device can be renamed to anything at all.
+    pub our_device_id: Option<String>,
 
     seek_step_ms: u64,
     volume_step: u32,
@@ -517,6 +520,7 @@ impl App {
             should_quit: false,
             connected_to_daemon,
             daemon_version: None,
+            our_device_id: None,
             seek_step_ms: u64::from(seek_step_secs) * 1000,
             volume_step: 5,
             pending_volume: None,
@@ -3005,7 +3009,7 @@ pub(crate) mod tests {
         assert!(app.playback().unwrap().progress() > first);
     }
 
-    fn device(name: &str) -> Device {
+    pub(crate) fn device(name: &str) -> Device {
         Device {
             id: Some(format!("id-{name}")),
             name: name.into(),
