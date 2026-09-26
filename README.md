@@ -8,6 +8,9 @@ $ boombox now --json | jq -r .track.name
 $ boombox            # opens the TUI
 ```
 
+![boombox playing a track: cover art, title, artist and album above the player
+bar](media/main_view.png)
+
 boombox is an independent project. It is not affiliated with, endorsed by or
 connected to Spotify; Spotify is a trademark of Spotify AB. Track, album,
 artist and playlist information, and album artwork, come from Spotify. You
@@ -204,34 +207,11 @@ too — `BOOMBOX_CONFIG_DIR`, `BOOMBOX_STATE_DIR` and `BOOMBOX_CACHE_DIR` overri
 Above it is the stage — what is playing, with its cover, or a visualisation —
 and your library opens over the stage as a box that `Tab` or `Esc` closes.
 
-```
-                                           Open Water
-                                         Example Artist
-                                            Horizons
+![Liked Songs open as a box over the bars visualisation, with the player bar
+underneath](media/liked_songs.png)
 
-
- [l]iked  [a]lbums  [p]laylists  [Q]ueue  [d]evices  [/] search  [v]isual  [?] help
-────────────────────────────────────────────────────────────────────────────────────────────────
- ▶  Open Water                        [s]huffle on  [r]epeat context            ♪ 62%  ▸ Desk ●
-    Example Artist
- 1:47 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━──────────────────────────────────────────────── 4:22
-```
-
-```
-           ╭ Playlists (3 of 3) ────────────────────────────────────────────────────╮
-           │  Recently played (1)                                                   │
-           │   1  Daily Mix 1  Playlist  ·  2h ago                                  │
-           │  Playlists (2)                                                         │
-           │   2  Weeknights   Alex  ·  42 tracks                                   │
-           │   3  Sundays      Alex  ·  18 tracks                                   │
-           ╰────────────────────────────────────────────────────────────────────────╯
-
- [↵] play  [t]rack  [e]nqueue  [E]nqueue all  [.] like  [A]dd playlist  [⇥] close  [?] help
-────────────────────────────────────────────────────────────────────────────────────────────────
- ▶  Open Water                        [s]huffle on  [r]epeat context            ♪ 62%  ▸ Desk ●
-    Example Artist
- 1:47 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━──────────────────────────────────────────────── 4:22
-```
+![The playlists view, Recently played listed above your own
+playlists](media/playlist.png)
 
 The line above the bar lists the keys for whatever is in front of you, and the
 status row names the keys that change it. The dot at its end says whether a
@@ -253,6 +233,15 @@ a second to stay inside the rate limit.
 | `.` | save or unsave the selected row |
 | `A` | add a playlist from a link, in the playlists view |
 | `v` `R` `?` `q` | cycle the visualisation · refresh · help · quit (`Q` is the queue) |
+
+| | |
+|---|---|
+| ![The queue](media/queue.png) | ![Searching for "queen": tracks, albums, artists and playlists at once](media/search.png) |
+
+`?` lists every key, and the build the TUI and the daemon are each running —
+the quickest way to spot a daemon left over from an older install.
+
+![The help overlay](media/keys.png)
 
 Lists page as you scroll rather than all at once — Liked Songs pulls 50 rows at
 a time and fetches the next page when the cursor nears the bottom. Search is
@@ -330,13 +319,12 @@ more to go back to the cover.
 A real FFT over the audio librespot is decoding — not a decoration driven by
 the progress bar.
 
-```
-        ██████████████▁
-  ▇▇▇▇▇▇███████████████    ▁▃▃▃
-  █████████████████████▆▆  ████▃
-  ███████████████████████▆▇█████    ▄   ▁
-▁▁██████████████████████████████ █████▂▂█▁██▂█ ▄▄ ▂   ▇▄ ▁▁
-```
+![Pressing v to cycle from bars to the spectrogram and back to the cover
+art](media/visualisers.gif)
+
+| bars | spectrogram | oscilloscope |
+|---|---|---|
+| ![](media/bars.png) | ![](media/spectrogram.png) | ![](media/oscilloscope.png) |
 
 The samples are tapped by wrapping librespot's `Sink`, so nothing in librespot
 is patched: the decorator copies each packet on its way to the speakers.
@@ -344,7 +332,8 @@ is patched: the decorator copies each packet on its way to the speakers.
 than mean so transients survive.
 
 **Bars** carry falling peak markers that decay against wall-clock time, so a
-resized or stalled terminal does not change how fast they fall.
+resized or stalled terminal does not change how fast they fall. The colours are
+taken from the cover art, so each track arrives with its own palette.
 
 **Spectrogram** is a waterfall: the newest moment at the right edge, low
 frequencies at the bottom, magnitude as colour. Each column is scaled against
