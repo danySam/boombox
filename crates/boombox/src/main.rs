@@ -152,14 +152,17 @@ async fn main() -> ExitCode {
     // The TUI owns the screen, so it logs to a file and installs its own
     // subscriber. Everything else logs to stderr.
     if !matches!(cli.command, None | Some(Command::Tui)) {
-        tracing_subscriber::fmt()
+        let builder = tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_env("BOOMBOX_LOG")
                     .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
             )
-            .with_writer(std::io::stderr)
-            .without_time()
-            .init();
+            .with_writer(std::io::stderr);
+        if logs_over_time(&cli.command) {
+            builder.init();
+        } else {
+            builder.without_time().init();
+        }
     }
 
     // Every run tightens the state directory, so an install made before this
@@ -263,6 +266,16 @@ fn into_player_command(command: Command) -> PlayerCommand {
     }
 }
 
+/// Whether this command's log will be read later rather than watched.
+///
+/// Only the daemon's is: it writes to a file for hours, and the question
+/// asked of that file afterwards is always when something happened. A
+/// timestamp on every line of `boombox now` would be noise in front of
+/// output the user is already watching arrive.
+fn logs_over_time(command: &Option<Command>) -> bool {
+    matches!(command, Some(Command::Daemon { status: false, stop: false }))
+}
+
 /// The exit code for arguments that did not parse.
 ///
 /// clap exits with 2 by default, which is the code documented for "not signed
@@ -275,6 +288,18 @@ fn parse_failure_code(err: &clap::Error) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Diagnosing a daemon means placing events in time; a crash report of
+    /// "it stopped at 11:20" cannot be matched to a log that says only what
+    /// happened, not when.
+    #[test]
+    fn only_a_running_daemon_stamps_its_log_with_the_time() {
+        assert!(logs_over_time(&Some(Command::Daemon { status: false, stop: false })));
+        assert!(!logs_over_time(&Some(Command::Daemon { status: true, stop: false })));
+        assert!(!logs_over_time(&Some(Command::Daemon { status: false, stop: true })));
+        assert!(!logs_over_time(&Some(Command::Setup)));
+        assert!(!logs_over_time(&None), "the TUI installs its own subscriber");
+    }
 
     /// Documented as 1, and distinct from 2, which means "not signed in".
     #[test]
