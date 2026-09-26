@@ -103,6 +103,13 @@ Confirmation output is written only when stdout is a terminal, so commands
 bound to a hotkey stay instant and pipelines stay clean. `--json` output is
 always written.
 
+`now --json` carries `"pending"`. It is true while a change has not come back
+from Spotify yet, which means the volume, position or play state beside it is
+what was asked for rather than what the API has confirmed — a write takes a
+poll or two to appear, and about eleven seconds for volume. A status line
+reading `"pending": false` is reading the player; `true` is reading intent
+that may still be refused.
+
 ## You need your own Spotify app
 
 There is no way around this. Spotify's February 2026 Developer Mode changes mean
@@ -214,10 +221,21 @@ underneath](media/liked_songs.png)
 playlists](media/playlist.png)
 
 The line above the bar lists the keys for whatever is in front of you, and the
-status row names the keys that change it. The dot at its end says whether a
-daemon is attached (`●`) or the TUI is talking to the API directly (`○`). That
-matters: with a daemon it polls four times a second, without one it polls once
-a second to stay inside the rate limit.
+status row names the keys that change it: `[s]huffle`, `[r]epeat`, `[</>] seek`
+and `[-/=]` in front of the volume. The last two are keys with no word to hide
+a letter in, so they appear as pairs instead. A narrower terminal sheds them —
+keys from 110 columns, words from 96, icons below that — because the state
+beside them is what the row is for.
+
+Keys move the screen at once and reach Spotify when you stop pressing. Holding
+`>` scrubs the bar and sends a single seek at the end, rather than one write
+per press each lurching the bar as it lands; two quick taps of `space` cancel
+out and send nothing at all.
+
+The dot at its end says whether a daemon is attached (`●`) or the TUI is
+talking to the API directly (`○`). That matters: with a daemon it polls four
+times a second, without one it polls once a second to stay inside the rate
+limit.
 
 | key | |
 |---|---|
