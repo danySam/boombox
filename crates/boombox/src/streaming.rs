@@ -9,6 +9,7 @@
 //! playback transfers here, whatever was playing elsewhere stops.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use boombox_core::Config;
@@ -166,6 +167,10 @@ pub struct Streaming {
     device_name: String,
     device_id: String,
     tap: Arc<SpectrumTap>,
+    /// Kept to be asked whether it is still alive. librespot marks a
+    /// session invalid the moment its connection breaks, and says a dead
+    /// one cannot be reused -- so this is how we learn to build another.
+    session: Session,
     /// The protocol loop. Finishing is how a dropped session announces
     /// itself: librespot logs the disconnection and the task returns, and
     /// if nobody is holding this the device simply vanishes while the
@@ -196,16 +201,49 @@ impl Streaming {
         }
     }
 
-    /// Waits for the Connect session to end.
+    /// Waits for the Connect session to end, or for its connection to die
+    /// under it -- whichever comes first.
     ///
-    /// Returns as soon as librespot stops driving the protocol, whether
-    /// that was a clean shutdown or the server closing the connection.
-    /// Callers cannot tell the two apart from here, and should not need
-    /// to: either way there is no device any more.
-    pub async fn ended(&mut self) {
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
+    /// The protocol task finishing is the tidy ending. The other one is
+    /// what this exists for: when the connection breaks, librespot
+    /// invalidates the session immediately but the task can keep running
+    /// for minutes, and everything it does in that time is against a
+    /// corpse. An audio key requested over a dead session times out in a
+    /// second and a half, after which the player reads the encrypted file
+    /// without decrypting it and feeds the decoder noise -- for ten
+    /// minutes, in the case that prompted this, while the device went on
+    /// advertising itself as healthy.
+    pub async fn ended(&mut self) -> Ended {
+        let Some(task) = self.task.take() else {
+            return Ended::Task;
+        };
+        tokio::select! {
+            _ = task => Ended::Task,
+            () = until_invalid(&self.session, INVALID_POLL) => Ended::ConnectionLost,
         }
+    }
+}
+
+/// Why a Connect session stopped being usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// librespot stopped driving the protocol, cleanly or otherwise.
+    Task,
+    /// The connection broke while the protocol task was still running.
+    ConnectionLost,
+}
+
+/// How often to ask whether the session is still alive.
+///
+/// A flag behind a read lock, so this is cheap; a second is far quicker
+/// than the ten minutes the old arrangement took to notice, and slow
+/// enough to cost nothing.
+const INVALID_POLL: Duration = Duration::from_secs(1);
+
+/// Returns once librespot has marked the session invalid.
+async fn until_invalid(session: &Session, every: Duration) {
+    while !session.is_invalid() {
+        tokio::time::sleep(every).await;
     }
 }
 
@@ -237,6 +275,9 @@ pub async fn start(config: &Config) -> Result<Streaming> {
     // the same id the Web API then reports -- so it, and not the name, is how
     // the daemon recognises its own device.
     let device_id = session.device_id().to_string();
+    // A Session is an Arc inside, so this is a handle to the same one Spirc
+    // is about to take, kept so its liveness can be watched.
+    let watched = session.clone();
 
     let player_config = PlayerConfig {
         bitrate: bitrate_from(settings.bitrate)?,
@@ -279,12 +320,43 @@ pub async fn start(config: &Config) -> Result<Streaming> {
     // goes silent. The handle is kept so its ending can be noticed.
     let task = tokio::spawn(spirc_task);
 
-    Ok(Streaming { spirc, device_name: name, device_id, tap, task: Some(task) })
+    Ok(Streaming { spirc, device_name: name, device_id, tap, session: watched, task: Some(task) })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point: a session whose connection has gone must be
+    /// noticed promptly, not when the protocol task eventually gives up.
+    #[tokio::test]
+    async fn a_dead_session_is_noticed() {
+        let session = Session::new(SessionConfig::default(), None);
+        assert!(!session.is_invalid(), "a fresh session is usable");
+
+        // librespot invalidates the session itself when the connection
+        // breaks; shutdown is the same flag by another route.
+        session.shutdown();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            until_invalid(&session, Duration::from_millis(10)),
+        )
+        .await
+        .expect("a dead session must be noticed, not waited on for ever");
+    }
+
+    /// And a live one is left alone: restarting a working session would
+    /// drop the audio it is carrying.
+    #[tokio::test]
+    async fn a_live_session_is_left_alone() {
+        let session = Session::new(SessionConfig::default(), None);
+        let waited = tokio::time::timeout(
+            Duration::from_millis(120),
+            until_invalid(&session, Duration::from_millis(10)),
+        )
+        .await;
+        assert!(waited.is_err(), "it must still be waiting");
+    }
 
     /// Two machines with one name each, rather than two rows both called
     /// "boombox".

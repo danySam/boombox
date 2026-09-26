@@ -585,15 +585,36 @@ async fn supervise_streaming(
                 });
 
                 tokio::select! {
-                    () = handle.ended() => {
+                    reason = handle.ended() => {
+                        let why = match reason {
+                            crate::streaming::Ended::ConnectionLost => {
+                                // Said plainly, because the symptom this
+                                // prevents -- ten minutes of noise from a
+                                // device claiming to play -- looks like
+                                // anything but a lost connection.
+                                tracing::warn!(
+                                    "the streaming connection dropped; \
+                                     restarting the session rather than \
+                                     playing on without it"
+                                );
+                                "the connection dropped; reconnecting"
+                            }
+                            crate::streaming::Ended::Task => {
+                                tracing::warn!("Connect session ended; reconnecting");
+                                "the session ended; reconnecting"
+                            }
+                        };
+                        // Ends the player as well as the protocol task. A
+                        // player left running against a dead session is
+                        // exactly what fed the decoder undecrypted audio.
+                        handle.shutdown();
                         *daemon.streaming_state.write().await =
-                            StreamingState::Unavailable("the session ended; reconnecting".into());
+                            StreamingState::Unavailable(why.into());
                         *daemon.spectrum.write().await = None;
                         // The next session registers a new id, and until it
                         // does we have no device: an id left behind here
                         // would be another machine's to match.
                         *daemon.device_id.write().await = None;
-                        tracing::warn!("Connect session ended; reconnecting");
                     }
                     _ = shutdown.changed() => {
                         handle.shutdown();
