@@ -79,6 +79,24 @@ pub fn draw(frame: &mut Frame, app: &App) -> Option<Rect> {
 /// the key is, so the word and the key teach each other. A number would
 /// have to be memorised separately from the thing it opens, which is what
 /// made the old digits hard to keep hold of.
+/// `("-/=", "")` renders as `[-/=]`, and `("</>", "seek")` as `[</>] seek`.
+///
+/// [`mnemonic`] puts one key inside its own word, which cannot express a
+/// pair: volume and seeking each have two keys and no word that contains
+/// either of them.
+fn keys(pair: &str, word: &str) -> Vec<Span<'static>> {
+    let bracket = Style::new().fg(DIM);
+    let mut spans = vec![
+        Span::styled("[", bracket),
+        Span::styled(pair.to_string(), Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled("]", bracket),
+    ];
+    if !word.is_empty() {
+        spans.push(Span::styled(format!(" {word}"), Style::new().fg(DIM)));
+    }
+    spans
+}
+
 fn mnemonic(word: &str, key: char) -> Vec<Span<'static>> {
     let bracket = Style::new().fg(DIM);
     let letter = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
@@ -439,10 +457,14 @@ fn player_bar(frame: &mut Frame, area: Rect, app: &App, state: Option<&PlaybackS
     // Words need roughly twice what the icons do; below this the title has
     // nothing left, so the icons come back.
     let wide = area.width >= 96;
+    // A third tier: the keys are the first thing to go, because the state
+    // beside them is what the row exists for. At 96 columns the words and
+    // a device name already leave the title little enough.
+    let hints = area.width >= 110;
     // Sized to what it holds. A fixed column clipped its right end, which is
     // where the device name and the daemon dot sit; the title gives way
     // instead, down to its minimum.
-    let meta = Line::from(meta_spans(app, state, wide));
+    let meta = Line::from(meta_spans(app, state, wide, hints));
     let meta_width = (meta.width() as u16).min(rows[0].width.saturating_sub(10));
     let split = Layout::default()
         .direction(Direction::Horizontal)
@@ -476,7 +498,7 @@ fn player_bar(frame: &mut Frame, area: Rect, app: &App, state: Option<&PlaybackS
 /// the state also teaches the key that changes it -- there is no second
 /// place to look up how to turn shuffle on. Falls back to icons when the
 /// terminal is too narrow to carry the words.
-fn meta_spans(app: &App, state: &PlaybackState, wide: bool) -> Vec<Span<'static>> {
+fn meta_spans(app: &App, state: &PlaybackState, wide: bool, hints: bool) -> Vec<Span<'static>> {
     let on = Style::new().fg(ACCENT);
     let off = Style::new().fg(DIM);
     let mut spans = Vec::new();
@@ -492,6 +514,12 @@ fn meta_spans(app: &App, state: &PlaybackState, wide: bool) -> Vec<Span<'static>
             format!(" {}  ", state.repeat_state),
             if state.repeat_state == boombox_core::api::RepeatState::Off { off } else { on },
         ));
+        // Seeking has no state to show, so it appears only as its keys --
+        // which were otherwise reachable only from the help screen.
+        if hints {
+            spans.extend(keys("</>", "seek"));
+            spans.push(Span::raw("  "));
+        }
     } else {
         spans.push(Span::styled(
             format!(" \u{21c4} {} ", if state.shuffle_state { "on" } else { "off" }),
@@ -504,7 +532,7 @@ fn meta_spans(app: &App, state: &PlaybackState, wide: bool) -> Vec<Span<'static>
     }
 
     if let Some(v) = app.volume() {
-        spans.extend(volume_field(v, app.volume_pending(), on, off));
+        spans.extend(volume_field(v, app.volume_pending(), hints, on, off));
     }
     if let Some(d) = &state.device {
         spans.push(Span::styled(format!("\u{25b8} {} ", d.name), off));
@@ -531,9 +559,18 @@ const VOLUME_FIELD: usize = VOLUME_BAR + 7;
 /// the API takes about eleven seconds to apply a change, so between the
 /// keypress and the sound there is nothing to watch. A filling bar at
 /// least shows where in the range the change is heading.
-fn volume_field(v: u32, pending: bool, on: Style, off: Style) -> Vec<Span<'static>> {
+fn volume_field(v: u32, pending: bool, hints: bool, on: Style, off: Style) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
+    // Added to both shapes or neither, so the field stays the width it
+    // was and the row does not shift as the bar comes and goes.
+    let hint = |spans: &mut Vec<Span<'static>>| {
+        if hints {
+            spans.extend(keys("-/=", ""));
+            spans.push(Span::raw(" "));
+        }
+    };
     if pending {
+        hint(&mut spans);
         let cells = bar(v as f64 / 100.0, VOLUME_BAR);
         let filled = cells.chars().filter(|c| *c == '\u{2501}').count();
         let mut chars = cells.chars();
@@ -548,6 +585,7 @@ fn volume_field(v: u32, pending: bool, on: Style, off: Style) -> Vec<Span<'stati
         let text = format!("\u{266a} {v}%");
         let pad = VOLUME_FIELD.saturating_sub(text.chars().count());
         spans.push(Span::raw(" ".repeat(pad)));
+        hint(&mut spans);
         spans.push(Span::styled(text, off));
     }
     spans.push(Span::raw("  "));
@@ -1671,8 +1709,8 @@ mod tests {
     #[test]
     fn the_volume_becomes_a_bar_while_a_change_is_in_flight() {
         let plain = Style::new();
-        let settled = volume_field(62, false, plain, plain);
-        let changing = volume_field(62, true, plain, plain);
+        let settled = volume_field(62, false, false, plain, plain);
+        let changing = volume_field(62, true, false, plain, plain);
 
         let text: String = changing.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains('\u{2501}'), "expected a bar: {text}");
@@ -1686,26 +1724,47 @@ mod tests {
     #[test]
     fn the_volume_field_is_the_same_width_either_way() {
         let plain = Style::new();
-        let settled = width_of(&volume_field(62, false, plain, plain));
-        for v in [0, 7, 62, 100] {
-            assert_eq!(
-                width_of(&volume_field(v, true, plain, plain)),
-                settled,
-                "bar at {v} must match the settled width"
-            );
-            assert_eq!(
-                width_of(&volume_field(v, false, plain, plain)),
-                settled,
-                "number at {v} must match too"
-            );
+        for hints in [false, true] {
+            let settled = width_of(&volume_field(62, false, hints, plain, plain));
+            for v in [0, 7, 62, 100] {
+                assert_eq!(
+                    width_of(&volume_field(v, true, hints, plain, plain)),
+                    settled,
+                    "bar at {v} must match the settled width (hints: {hints})"
+                );
+                assert_eq!(
+                    width_of(&volume_field(v, false, hints, plain, plain)),
+                    settled,
+                    "number at {v} must match too (hints: {hints})"
+                );
+            }
         }
+    }
+
+    /// Seeking and volume were the two things you could only learn from
+    /// the help screen, because neither has a word on the row to sit in.
+    #[test]
+    fn a_wide_row_teaches_the_seek_and_volume_keys() {
+        let text = render(&playing_app(), 120, 12);
+        assert!(text.contains("[</>]"), "{text}");
+        assert!(text.contains("[-/=]"), "{text}");
+    }
+
+    /// The keys go before the state does: the row exists to show shuffle,
+    /// repeat and the volume, not to teach.
+    #[test]
+    fn a_middling_row_keeps_the_words_and_drops_the_keys() {
+        let text = render(&playing_app(), 100, 12);
+        assert!(text.contains("[s]huffle"), "the words stay: {text}");
+        assert!(!text.contains("[</>]"), "the keys go: {text}");
+        assert!(!text.contains("[-/=]"), "{text}");
     }
 
     #[test]
     fn the_bar_fills_in_proportion_to_the_volume() {
         let plain = Style::new();
         let filled = |v| {
-            volume_field(v, true, plain, plain)
+            volume_field(v, true, false, plain, plain)
                 .iter()
                 .map(|s| s.content.chars().filter(|c| *c == '\u{2501}').count())
                 .sum::<usize>()
@@ -2189,15 +2248,34 @@ mod tests {
     /// daemon is attached, so a device name beside it must not push it off.
     #[test]
     fn the_status_row_keeps_the_daemon_dot_after_the_device() {
+        // A machine name of any length, at every tier -- including 110,
+        // where the seek and volume keys join the row and make it longest.
+        let long_name = r#"{"is_playing":true,"progress_ms":60000,
+            "device":{"id":"d","name":"boombox on a-long-machine-name","type":"Computer",
+                      "volume_percent":62},
+            "item":{"type":"track","name":"x","uri":"u","duration_ms":200000,
+                    "artists":[],"album":{}}}"#;
+        let states = || {
+            [
+                crate::app::tests::playing_state(62, false, true),
+                serde_json::from_str(long_name).unwrap(),
+            ]
+        };
         for (connected, dot) in [(true, '\u{25cf}'), (false, '\u{25cb}')] {
-            let mut app = App::new(5, connected);
-            app.set_playback(Some(crate::app::tests::playing_state(62, false, true)));
-            for width in [80, 104] {
-                let text = render(&app, width, 8);
-                let line = text.lines().find(|l| l.contains('\u{21c4}') || l.contains("[s]huffle"));
-                let line = line.unwrap_or_default();
-                assert!(line.contains('\u{25b8}'), "the device is shown at {width}: {line}");
-                assert!(line.trim_end().ends_with(dot), "and the dot after it at {width}: {line}");
+            for state in states() {
+                let mut app = App::new(5, connected);
+                app.set_playback(Some(state));
+                for width in [80, 104, 110, 120] {
+                    let text = render(&app, width, 8);
+                    let line =
+                        text.lines().find(|l| l.contains('\u{21c4}') || l.contains("[s]huffle"));
+                    let line = line.unwrap_or_default();
+                    assert!(line.contains('\u{25b8}'), "the device is shown at {width}: {line}");
+                    assert!(
+                        line.trim_end().ends_with(dot),
+                        "and the dot after it at {width}: {line}"
+                    );
+                }
             }
         }
     }
@@ -2207,6 +2285,7 @@ mod tests {
     fn a_narrow_terminal_falls_back_to_icons() {
         let text = render(&playing_app(), 80, 8);
         assert!(!text.contains("[s]huffle"), "no room for words: {text}");
+        assert!(!text.contains("[</>]"), "nor for the keys: {text}");
         assert!(text.contains("\u{21c4}"), "but the state is still shown: {text}");
     }
 
