@@ -8,6 +8,7 @@ pub mod auth;
 pub mod build_info;
 pub mod config;
 pub mod error;
+pub mod intent;
 pub mod oembed;
 pub mod private;
 pub mod recent;
