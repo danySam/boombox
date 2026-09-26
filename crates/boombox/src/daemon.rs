@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use boombox_core::api::library::LibraryApi;
 use boombox_core::api::player::PlayerApi;
-use boombox_core::api::{Pendings, PlaybackState};
+use boombox_core::api::{Pendings, PlayOptions, PlaybackState};
 use boombox_core::intent::Pending;
 use boombox_core::{Client, Config, Error};
 use boombox_ipc::protocol::{PROTOCOL_VERSION, StreamingState};
@@ -159,6 +159,25 @@ fn renew<T: Copy>(slot: &mut Option<Pending<T>>, wanted: T, settle: Duration, no
 fn projected_position(pending: &Pending<u64>, playing: bool, now: Instant) -> u64 {
     let travelled = if playing { pending.age(now).as_millis() as u64 } else { 0 };
     pending.wanted().saturating_add(travelled)
+}
+
+/// The same play, aimed at our own Connect device, when there is nowhere
+/// else for it to go.
+///
+/// Spotify refuses a play with no active device, and after a long idle it
+/// drops the active device while still listing it -- so the device is
+/// there in the picker and playing fails anyway. Pressing play is consent
+/// enough to use the device we are: this is not
+/// [`DaemonConfig::adopt_playback`], which takes the active slot at
+/// startup without anyone asking.
+///
+/// A device the caller chose is left alone. `boombox connect kitchen`
+/// followed by a play means the kitchen, even if the kitchen is asleep.
+fn play_here(opts: &PlayOptions, ours: Option<&str>) -> Option<PlayOptions> {
+    if opts.device_id.is_some() {
+        return None;
+    }
+    Some(opts.clone().on_device(Some(ours?.to_string())))
 }
 
 /// What a write means for the state being held.
@@ -785,6 +804,18 @@ impl Daemon {
         Some(overlay(state, &cache.intents, elapsed, now))
     }
 
+    /// Our own Connect device, while one is registered.
+    #[cfg(feature = "streaming")]
+    async fn our_device(&self) -> Option<String> {
+        self.device_id.read().await.clone()
+    }
+
+    /// Without streaming there is no device of ours to fall back to.
+    #[cfg(not(feature = "streaming"))]
+    async fn our_device(&self) -> Option<String> {
+        None
+    }
+
     /// Holds what a write asked for until the player reports it.
     async fn remember(&self, what: Wrote) {
         let now = Instant::now();
@@ -896,7 +927,22 @@ impl Daemon {
                 if let Some(uri) = opts.context_uri.clone() {
                     self.recents.touch(&uri).await;
                 }
-                unit(client.play(opts).await)?
+                match client.play(opts.clone()).await {
+                    Err(Error::NoActiveDevice) => {
+                        // Nowhere to play, and we are somewhere. One retry,
+                        // aimed at ourselves; if that fails too the error
+                        // is the real one and the caller hears it.
+                        let ours = self.our_device().await;
+                        match play_here(&opts, ours.as_deref()) {
+                            Some(here) => {
+                                tracing::info!("nothing was active, so playing here instead");
+                                unit(client.play(here).await)?
+                            }
+                            None => return Err(Error::NoActiveDevice),
+                        }
+                    }
+                    other => unit(other)?,
+                }
             }
             Request::Pause => unit(client.pause().await)?,
             Request::Next => unit(client.next().await)?,
@@ -1616,6 +1662,39 @@ mod tests {
         let note = idle_streaming_note(&StreamingState::NotSignedIn);
         assert!(note.contains("auth login --streaming"), "{note}");
         assert!(note.contains("Everything else works"), "{note}");
+    }
+
+    /// The dead end this removes: the device is listed, play fails, and
+    /// the only way out was to know about `boombox connect`.
+    #[test]
+    fn a_play_with_nowhere_to_go_comes_here() {
+        let retried = play_here(&PlayOptions::resume(), Some("ours")).expect("should retry");
+        assert_eq!(retried.device_id.as_deref(), Some("ours"));
+    }
+
+    /// The body still says what to play; only the destination is added.
+    #[test]
+    fn the_retry_keeps_what_was_asked_for() {
+        let opts = PlayOptions::context("spotify:album:x");
+        let retried = play_here(&opts, Some("ours")).expect("should retry");
+        assert_eq!(retried.context_uri.as_deref(), Some("spotify:album:x"));
+        assert_eq!(retried.device_id.as_deref(), Some("ours"));
+    }
+
+    /// `boombox connect kitchen` then play means the kitchen, asleep or
+    /// not. Redirecting that to ourselves would be answering a different
+    /// question from the one asked.
+    #[test]
+    fn a_chosen_device_is_never_overridden() {
+        let opts = PlayOptions::resume().on_device(Some("kitchen".into()));
+        assert!(play_here(&opts, Some("ours")).is_none(), "the chosen device stands");
+    }
+
+    /// A build without streaming, or a session not yet up, has no device
+    /// of its own -- so the original error stands.
+    #[test]
+    fn with_no_device_of_our_own_the_error_stands() {
+        assert!(play_here(&PlayOptions::resume(), None).is_none(), "nothing to fall back to");
     }
 
     const POLLED: &str = r#"{"is_playing":true,"progress_ms":60000,
