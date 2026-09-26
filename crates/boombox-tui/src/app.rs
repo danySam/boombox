@@ -138,6 +138,28 @@ const VOLUME_SETTLE: Duration = Duration::from_secs(20);
 /// has played on past it.
 const SEEK_CHAIN: Duration = Duration::from_millis(1200);
 
+/// How long to wait for more seek keys before sending one seek.
+///
+/// A run of presses is one intent: the bar follows every press at once,
+/// and the API hears the place the user stopped on. Ten taps used to be
+/// ten writes, each one lurching the bar as its confirmation arrived.
+const SEEK_COALESCE: Duration = Duration::from_millis(300);
+
+/// How long to wait before deciding two taps of space cancelled out.
+///
+/// Short enough that a single press still feels immediate -- the glyph
+/// has already flipped locally by then -- and long enough that a double
+/// tap is recognised as the nothing it is.
+const PLAYING_COALESCE: Duration = Duration::from_millis(200);
+
+/// Backstops, for a change the player never comes to report.
+const SEEK_SETTLE: Duration = Duration::from_secs(10);
+const PLAYING_SETTLE: Duration = Duration::from_secs(8);
+
+/// How far out a reported position may be and still count as agreement:
+/// the track plays on between the write landing and the poll seeing it.
+const POSITION_TOLERANCE_MS: u64 = 2_500;
+
 /// How far out the reported volume may be and still count as agreement.
 /// The device rounds -- ask for 55 and it reads back 54 -- so an exact
 /// match would never arrive.
@@ -435,6 +457,16 @@ pub struct App {
     pending_seek: Option<u64>,
     /// When that target was set.
     seek_touched: Instant,
+    /// Whether `pending_seek` has been sent yet.
+    seek_sent: bool,
+    /// Whether the user has asked to be playing or paused, ahead of the
+    /// API agreeing. Two taps of space inside the window cancel out and
+    /// nothing is sent at all.
+    pending_playing: Option<bool>,
+    /// When the last play/pause key arrived.
+    playing_touched: Instant,
+    /// Whether `pending_playing` has been sent yet.
+    playing_sent: bool,
 }
 
 impl App {
@@ -492,6 +524,10 @@ impl App {
             volume_sent: false,
             pending_seek: None,
             seek_touched: Instant::now(),
+            seek_sent: false,
+            pending_playing: None,
+            playing_touched: Instant::now(),
+            playing_sent: false,
         }
     }
 
@@ -502,11 +538,14 @@ impl App {
         self.playback = state;
         self.playback_at = Instant::now();
         self.reconcile_volume();
+        self.reconcile_seek();
+        self.reconcile_playing();
         let changed = previous != self.current_uri();
         if changed {
             // A target measured against the track that just ended would
             // otherwise base the next seek in the one that replaced it.
             self.pending_seek = None;
+            self.seek_sent = false;
             self.palette = match self.current_uri() {
                 Some(uri) => Palette::for_uri(&uri),
                 None => Palette::default(),
@@ -519,10 +558,46 @@ impl App {
         self.playback.as_ref()?.item.as_ref().and_then(PlayingItem::uri).map(str::to_owned)
     }
 
-    /// Playback with the progress clock advanced to now, so the timer moves
-    /// between polls instead of stepping.
-    pub fn playback(&self) -> Option<PlaybackState> {
+    /// What the player last reported, with the clock advanced to now and
+    /// nothing of ours laid over it.
+    ///
+    /// Arithmetic uses this, never [`Self::playback`]: basing a seek on a
+    /// position we are already previewing would add a step to a step and
+    /// walk away from the music.
+    fn reported(&self) -> Option<PlaybackState> {
         self.playback.as_ref().map(|s| s.advanced_by(self.playback_at.elapsed()))
+    }
+
+    /// Playback as the user has asked for it, with the progress clock
+    /// advanced to now so the timer moves between polls instead of
+    /// stepping.
+    ///
+    /// Anything outstanding is shown in place of the reported value. This
+    /// is what makes a keypress land on screen at once rather than a poll
+    /// or two later, and it is why the seek bar can be scrubbed.
+    pub fn playback(&self) -> Option<PlaybackState> {
+        let mut state = self.playback.clone()?;
+        if let Some(playing) = self.pending_playing {
+            state.is_playing = playing;
+            state.pending.playing = true;
+        }
+        match self.pending_seek {
+            // Held still at the target: the bar answers the keys, not the
+            // clock, until the seek is sent and confirmed.
+            Some(target) => {
+                let duration = state.duration();
+                state.progress_ms = Some(if duration > 0 { target.min(duration) } else { target });
+                state.pending.position = true;
+            }
+            None => state = state.advanced_by(self.playback_at.elapsed()),
+        }
+        if let Some(volume) = self.pending_volume
+            && let Some(device) = state.device.as_mut()
+        {
+            device.volume_percent = Some(volume);
+            state.pending.volume = true;
+        }
+        Some(state)
     }
 
     pub fn set_devices(&mut self, devices: Vec<Device>) {
@@ -777,6 +852,114 @@ impl App {
         {
             self.pending_volume = None;
         }
+    }
+
+    /// Everything with a deadline that has come due, in one call: the
+    /// loop wakes once for the earliest of them and asks what to do.
+    pub fn flush_due(&mut self) -> Vec<Command> {
+        [self.flush_volume(), self.flush_seek(), self.flush_playing()]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// When the loop next needs waking, or `None` when nothing is
+    /// outstanding -- so an idle TUI sleeps instead of ticking.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        [self.volume_deadline(), self.seek_deadline(), self.playing_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    fn seek_deadline(&self) -> Option<Instant> {
+        self.pending_seek?;
+        let wait = if self.seek_sent { SEEK_SETTLE } else { SEEK_COALESCE };
+        Some(self.seek_touched + wait)
+    }
+
+    fn playing_deadline(&self) -> Option<Instant> {
+        self.pending_playing?;
+        let wait = if self.playing_sent { PLAYING_SETTLE } else { PLAYING_COALESCE };
+        Some(self.playing_touched + wait)
+    }
+
+    /// Sends the place the keys stopped on, once they have stopped.
+    fn flush_seek(&mut self) -> Option<Command> {
+        let target = self.pending_seek?;
+        if !self.seek_sent {
+            if self.seek_touched.elapsed() < SEEK_COALESCE {
+                return None;
+            }
+            self.seek_sent = true;
+            return Some(Command::Seek(target));
+        }
+        if self.seek_touched.elapsed() >= SEEK_SETTLE {
+            self.pending_seek = None;
+            self.seek_sent = false;
+        }
+        None
+    }
+
+    /// Sends a play or a pause, unless the taps cancelled each other out.
+    fn flush_playing(&mut self) -> Option<Command> {
+        let wanted = self.pending_playing?;
+        if !self.playing_sent {
+            if self.playing_touched.elapsed() < PLAYING_COALESCE {
+                return None;
+            }
+            // Two taps inside the window leave the player where it
+            // already was, so there is nothing to ask for.
+            if self.playback.as_ref().is_some_and(|s| s.is_playing == wanted) {
+                self.pending_playing = None;
+                return None;
+            }
+            self.playing_sent = true;
+            return Some(if wanted { Command::Resume } else { Command::Pause });
+        }
+        if self.playing_touched.elapsed() >= PLAYING_SETTLE {
+            self.pending_playing = None;
+            self.playing_sent = false;
+        }
+        None
+    }
+
+    /// Hands the position back to the API once it reports somewhere near
+    /// where the seek asked to be.
+    fn reconcile_seek(&mut self) {
+        let (Some(target), true) = (self.pending_seek, self.seek_sent) else {
+            return;
+        };
+        if let Some(reported) = self.playback.as_ref().and_then(|s| s.progress_ms)
+            && reported.abs_diff(target) <= POSITION_TOLERANCE_MS
+        {
+            self.pending_seek = None;
+            self.seek_sent = false;
+            // The clock starts again from the poll that agreed.
+            self.playback_at = Instant::now();
+        }
+    }
+
+    fn reconcile_playing(&mut self) {
+        let (Some(wanted), true) = (self.pending_playing, self.playing_sent) else {
+            return;
+        };
+        if self.playback.as_ref().is_some_and(|s| s.is_playing == wanted) {
+            self.pending_playing = None;
+            self.playing_sent = false;
+        }
+    }
+
+    /// Pretends the seek keys stopped long enough ago to flush.
+    #[cfg(test)]
+    pub(crate) fn expire_seek_coalesce(&mut self) {
+        self.seek_touched = Instant::now() - SEEK_COALESCE;
+    }
+
+    /// Pretends the play/pause keys stopped long enough ago to flush.
+    #[cfg(test)]
+    pub(crate) fn expire_playing_coalesce(&mut self) {
+        self.playing_touched = Instant::now() - PLAYING_COALESCE;
     }
 
     /// Sends the accumulated volume once the keys have stopped, then drops
@@ -1106,7 +1289,14 @@ impl App {
 
             Action::PlayPause => {
                 let playing = self.playback.as_ref().is_some_and(|s| s.is_playing);
-                return Some(if playing { Command::Pause } else { Command::Resume });
+                // Recorded rather than sent: the glyph flips now, and if
+                // a second tap arrives inside the window the two cancel
+                // and nothing goes out at all.
+                let wanted = !self.pending_playing.unwrap_or(playing);
+                self.pending_playing = Some(wanted);
+                self.playing_touched = Instant::now();
+                self.playing_sent = false;
+                return None;
             }
             Action::NextTrack => return Some(Command::Next),
             Action::PreviousTrack => return Some(Command::Previous),
@@ -1114,7 +1304,7 @@ impl App {
             Action::SeekForward | Action::SeekBackward => {
                 // Advanced to now, not the figure the last poll carried:
                 // that one is a fraction of a second behind the music.
-                let live = self.playback()?;
+                let live = self.reported()?;
                 // Counted from the last target while the keys are still
                 // coming, for the reason volume is: presses inside one
                 // poll interval all read the same position, so they would
@@ -1128,9 +1318,11 @@ impl App {
                 } else {
                     current.saturating_sub(self.seek_step_ms)
                 };
+                // The bar moves now; the seek goes out when the keys stop.
                 self.pending_seek = Some(target);
                 self.seek_touched = Instant::now();
-                return Some(Command::Seek(target));
+                self.seek_sent = false;
+                return None;
             }
 
             Action::VolumeUp | Action::VolumeDown => {
@@ -1419,13 +1611,20 @@ pub(crate) mod tests {
         app
     }
 
+    /// Pressing it shows the change at once and sends nothing yet; the
+    /// command follows when the keys have stopped.
     #[test]
     fn play_pause_depends_on_current_state() {
         let mut app = app_with_state(playing_state(50, false, true));
-        assert_eq!(app.update(Action::PlayPause), Some(Command::Pause));
+        assert_eq!(app.update(Action::PlayPause), None, "nothing goes out per press");
+        assert!(!app.playback().unwrap().is_playing, "but the screen says paused");
+        app.expire_playing_coalesce();
+        assert_eq!(app.flush_due(), vec![Command::Pause]);
 
         let mut app = app_with_state(playing_state(50, false, false));
-        assert_eq!(app.update(Action::PlayPause), Some(Command::Resume));
+        app.update(Action::PlayPause);
+        app.expire_playing_coalesce();
+        assert_eq!(app.flush_due(), vec![Command::Resume]);
     }
 
     #[test]
@@ -1444,11 +1643,17 @@ pub(crate) mod tests {
     /// millisecond depends on how long the test itself took. A step is
     /// five seconds; a hundred milliseconds of slack cannot hide an error
     /// that matters.
+    /// Presses the key, then lets the window lapse, which is what the
+    /// event loop does when the keys stop arriving.
     #[track_caller]
-    fn seeks_to(command: Option<Command>, expected: u64) {
-        let Some(Command::Seek(ms)) = command else {
-            panic!("expected a seek, got {command:?}");
+    fn seeks_to(app: &mut App, action: Action, expected: u64) {
+        assert_eq!(app.update(action), None, "nothing goes out per press");
+        app.expire_seek_coalesce();
+        let commands = app.flush_due();
+        let [Command::Seek(ms)] = commands.as_slice() else {
+            panic!("expected one seek, got {commands:?}");
         };
+        let ms = *ms;
         assert!(
             (expected..expected + 100).contains(&ms),
             "expected about {expected}ms, got {ms}ms"
@@ -1461,9 +1666,9 @@ pub(crate) mod tests {
     #[test]
     fn a_run_of_seeks_accumulates_instead_of_collapsing() {
         let mut app = app_with_state(playing_state(50, false, true));
-        seeks_to(app.update(Action::SeekForward), 65_000);
-        seeks_to(app.update(Action::SeekForward), 70_000);
-        seeks_to(app.update(Action::SeekForward), 75_000);
+        seeks_to(&mut app, Action::SeekForward, 65_000);
+        seeks_to(&mut app, Action::SeekForward, 70_000);
+        seeks_to(&mut app, Action::SeekForward, 75_000);
     }
 
     /// Going back undoes going forward, rather than landing a step behind
@@ -1471,8 +1676,8 @@ pub(crate) mod tests {
     #[test]
     fn a_seek_back_undoes_a_seek_forward() {
         let mut app = app_with_state(playing_state(50, false, true));
-        seeks_to(app.update(Action::SeekForward), 65_000);
-        seeks_to(app.update(Action::SeekBackward), 60_000);
+        seeks_to(&mut app, Action::SeekForward, 65_000);
+        seeks_to(&mut app, Action::SeekBackward, 60_000);
     }
 
     /// Chaining is for a run of presses. A target from a minute ago is not
@@ -1480,16 +1685,59 @@ pub(crate) mod tests {
     #[test]
     fn a_seek_after_a_gap_starts_from_the_live_position() {
         let mut app = app_with_state(playing_state(50, false, true));
-        seeks_to(app.update(Action::SeekForward), 65_000);
+        seeks_to(&mut app, Action::SeekForward, 65_000);
         app.expire_seek_chain();
-        seeks_to(app.update(Action::SeekForward), 65_000);
+        seeks_to(&mut app, Action::SeekForward, 65_000);
+    }
+
+    /// The point of the whole exercise: two taps of space are a decision
+    /// not to change anything, and must cost no API call at all.
+    #[test]
+    fn two_quick_taps_of_space_cancel_each_other_out() {
+        let mut app = app_with_state(playing_state(50, false, true));
+        app.update(Action::PlayPause);
+        app.update(Action::PlayPause);
+        assert!(app.playback().unwrap().is_playing, "back where it started");
+        app.expire_playing_coalesce();
+        assert_eq!(app.flush_due(), vec![], "and nothing was asked of Spotify");
+    }
+
+    /// Three taps is one decision, and it is the odd one out.
+    #[test]
+    fn an_odd_number_of_taps_still_changes_it() {
+        let mut app = app_with_state(playing_state(50, false, true));
+        for _ in 0..3 {
+            app.update(Action::PlayPause);
+        }
+        app.expire_playing_coalesce();
+        assert_eq!(app.flush_due(), vec![Command::Pause]);
+    }
+
+    /// The bar answers the key straight away, before anything is sent.
+    #[test]
+    fn the_bar_shows_the_seek_before_it_is_sent() {
+        let mut app = app_with_state(playing_state(50, false, true));
+        app.update(Action::SeekForward);
+        assert_eq!(app.playback().unwrap().progress_ms, Some(65_000));
+        assert!(app.playback().unwrap().pending.position, "and says it is not confirmed");
+    }
+
+    /// A run of keys is one write, whatever its length.
+    #[test]
+    fn a_run_of_seeks_sends_exactly_one_command() {
+        let mut app = app_with_state(playing_state(50, false, true));
+        for _ in 0..10 {
+            assert_eq!(app.update(Action::SeekForward), None);
+        }
+        app.expire_seek_coalesce();
+        assert_eq!(app.flush_due(), vec![Command::Seek(110_000)], "60s + 10 x 5s");
     }
 
     /// A target belongs to the track it was measured in.
     #[test]
     fn a_new_track_drops_the_chained_target() {
         let mut app = app_with_state(playing_state(50, false, true));
-        seeks_to(app.update(Action::SeekForward), 65_000);
+        seeks_to(&mut app, Action::SeekForward, 65_000);
         app.set_playback(Some(
             serde_json::from_str(
                 r#"{"is_playing":true,"progress_ms":10000,
@@ -1498,13 +1746,13 @@ pub(crate) mod tests {
             )
             .unwrap(),
         ));
-        seeks_to(app.update(Action::SeekForward), 15_000);
+        seeks_to(&mut app, Action::SeekForward, 15_000);
     }
 
     #[test]
     fn seek_uses_the_configured_step_and_clamps() {
         let mut app = app_with_state(playing_state(50, false, true));
-        seeks_to(app.update(Action::SeekForward), 65_000);
+        seeks_to(&mut app, Action::SeekForward, 65_000);
 
         let mut app = App::new(5, false);
         app.set_playback(Some(
@@ -1515,7 +1763,7 @@ pub(crate) mod tests {
             )
             .unwrap(),
         ));
-        assert_eq!(app.update(Action::SeekBackward), Some(Command::Seek(0)), "cannot go negative");
+        seeks_to(&mut app, Action::SeekBackward, 0);
     }
 
     /// The end of the track is the end of the seek, however many presses
@@ -1526,7 +1774,8 @@ pub(crate) mod tests {
         for _ in 0..60 {
             app.update(Action::SeekForward);
         }
-        seeks_to(app.update(Action::SeekForward), 200_000);
+        seeks_to(&mut app, Action::SeekForward, 200_000);
+        assert_eq!(app.flush_due(), vec![], "one seek for the whole run, not sixty");
     }
 
     /// The reported bug: eight rapid presses moved the volume by one step,

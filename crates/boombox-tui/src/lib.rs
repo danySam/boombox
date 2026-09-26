@@ -179,19 +179,19 @@ where
         }
 
         // Computed before the select so the branch borrows nothing.
-        let volume_at = app.volume_deadline();
+        let deadline = app.next_deadline();
 
         tokio::select! {
-            // Never fires unless a volume change is outstanding: with
-            // nothing pending this branch waits forever, so an idle TUI is
-            // not woken on a timer it has no use for.
+            // Never fires unless something is outstanding: with nothing
+            // pending this branch waits forever, so an idle TUI is not
+            // woken on a timer it has no use for.
             () = async {
-                match volume_at {
+                match deadline {
                     Some(at) => tokio::time::sleep_until(at.into()).await,
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(command) = app.flush_volume() {
+                for command in app.flush_due() {
                     dispatch(&api, &tx, command);
                 }
             },
