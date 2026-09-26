@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "boombox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "boombox-core",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "boombox-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "directories",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "boombox-ipc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "boombox-core",
  "serde",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "boombox-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
