@@ -1,0 +1,185 @@
+name: Release
+
+# Binaries, so that installing boombox does not mean compiling a Rust
+# workspace. The Homebrew formula builds from source today, which costs
+# everyone who installs it a ~2 GB toolchain; these assets are what lets
+# that stop. Streaming is compiled in, because a binary without it is a
+# remote control with nothing to play on.
+on:
+  push:
+    tags: ["v*"]
+  # Builds the same tarballs and keeps them as run artifacts without
+  # touching any release, so the whole thing can be proved before a tag
+  # depends on it.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install ALSA headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-check
+
+      # A tag that disagrees with Cargo.toml ships binaries naming a version
+      # nobody released. Cheaper to catch here than to delete assets later.
+      - name: Tag matches the workspace version
+        if: github.ref_type == 'tag'
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          declared="$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "boombox") | .version')"
+          echo "tag $tagged, Cargo.toml $declared"
+          if [ "$tagged" != "$declared" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $declared in Cargo.toml"
+            exit 1
+          fi
+
+      # CI runs on main and on pull requests, never on tags, so without this
+      # a tag could ship a commit that nothing ever tested.
+      - run: cargo test --locked --workspace --features streaming
+
+      # A binary release carries its dependencies inside it, and their
+      # licences oblige it to carry their texts too. See CONTRIBUTING.md.
+      # Generated once here rather than in each build job: the answer does
+      # not depend on the target, and cargo-about is not free to install.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - name: Third-party licences
+        run: cargo about generate --all-features about.hbs > THIRD_PARTY_LICENSES.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: third-party-licences
+          path: THIRD_PARTY_LICENSES.html
+          if-no-files-found: error
+
+  build:
+    name: ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # Cross-compiled rather than built on an Intel runner: the macOS
+          # SDK carries both architectures, and GitHub's Intel images are on
+          # their way out.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          # 22.04 rather than latest on purpose. A binary links the glibc it
+          # was built against and runs on anything newer, so building on the
+          # oldest supported image is what makes it work on more than the
+          # runner's own distribution.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # build.rs refuses to number a shallow clone -- a partial history
+          # gives a confidently wrong count. Without the full history every
+          # binary here would ship stampless, and a daemon with no build
+          # number cannot be compared against the one replacing it, which is
+          # the entire reason the number exists.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install ALSA headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --release --features streaming --target ${{ matrix.target }} -p boombox
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: third-party-licences
+
+      - name: Package
+        id: package
+        run: |
+          version="$GITHUB_REF_NAME"
+          [ "${{ github.ref_type }}" = "tag" ] || version="dev-$(git rev-parse --short=9 HEAD)"
+          name="boombox-$version-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/boombox" \
+            README.md LICENSE THIRD_PARTY_LICENSES.html "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      # Proves the full checkout actually took effect. A stampless binary is
+      # a silent regression: it installs fine and then reports itself as up
+      # to date forever.
+      - name: Binary reports a build number
+        if: matrix.target != 'x86_64-apple-darwin' # The one target this runner cannot execute.
+        run: |
+          reported="$(./dist/${{ steps.package.outputs.name }}/boombox --version)"
+          echo "$reported"
+          case "$reported" in
+            *"#"*) ;;
+            *) echo "::error::'$reported' carries no build number"; exit 1 ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Attach to the release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      # The notes on this project are written by hand. When the release does
+      # not exist yet this leaves a draft for a person to finish; when it
+      # does, the assets go in and the prose is left alone.
+      - name: Upload
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --draft \
+              --title "boombox ${GITHUB_REF_NAME#v}" \
+              --notes "Binaries attached by CI. Notes to follow."
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --clobber
