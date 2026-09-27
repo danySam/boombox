@@ -66,3 +66,19 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses
+
+  # Reports, and deliberately does not block. Every advisory against this
+  # tree today is inside librespot's dependencies, with no newer librespot
+  # to move to -- so a blocking check would fail every run for problems
+  # nobody here can fix, and a CI that is always red stops being read. It
+  # is here to catch the next one, especially in a dependency we chose.
+  # See SECURITY.md. Make it blocking once the librespot subtree is clear.
+  advisories:
+    name: Security advisories (report only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

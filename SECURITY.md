@@ -21,6 +21,27 @@ public issue. Only the latest `main` is supported.
 
 boombox re-tightens those permissions every time it starts.
 
+## Known advisories in dependencies
+
+Streaming builds embed [librespot], which brings its own dependency tree.
+That tree currently carries nine published advisories: a timing side
+channel in `rsa`, two denial-of-service issues in `quick-xml`, several
+certificate-validation issues in the `rustls 0.22` generation reached
+through `hyper-proxy2`, and `rustls-pemfile` being unmaintained.
+
+All nine are upstream. None are reachable through boombox's own
+dependencies, and none can be configured away: `hyper-proxy2` is required
+by every TLS option librespot offers. librespot 0.8.0 is its latest
+release, so there is nothing to upgrade to. They will clear when librespot
+moves to the current `rustls` generation.
+
+Builds without `--features streaming` do not include any of this.
+
+CI reports advisories on every run but does not fail on them, for the
+reason above. That becomes a blocking check once the tree is clear.
+
+[librespot]: https://github.com/librespot-org/librespot
+
 ## Where it connects
 
 `api.spotify.com` and `accounts.spotify.com` for the Web API and sign-in;
