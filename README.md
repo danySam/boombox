@@ -151,9 +151,25 @@ see the redirect URI; Spotify only checks that after you sign in.
 ## Install
 
 boombox runs on **macOS and Linux**. The daemon talks over Unix sockets, so
-Windows is not supported. You need **Rust 1.88 or newer** from
-<https://rustup.rs>, and **Spotify Premium** with a developer app of your
-own — `boombox setup` walks you through that part.
+Windows is not supported. Whichever way you install it you need **Spotify
+Premium** and a developer app of your own, which `boombox setup` walks you
+through.
+
+### Homebrew
+
+```console
+brew install danySam/boombox/boombox
+boombox setup
+```
+
+The shortest route, and the only one that needs nothing installed first:
+Homebrew fetches Rust to build with and drops it afterwards. Streaming is
+included, so boombox appears in Spotify's device list and can play the
+audio itself.
+
+### With cargo
+
+Needs **Rust 1.88 or newer** from <https://rustup.rs>.
 
 ```console
 cargo install boombox --locked
@@ -161,13 +177,14 @@ boombox setup
 ```
 
 That gives you the CLI and the TUI, driving Spotify on your other devices —
-your phone, the desktop app, a speaker.
+your phone, the desktop app, a speaker. For audio on this machine, read on.
 
-### With audio on this machine
+#### Audio on this machine
 
-To have boombox appear in Spotify's device list and play the audio itself,
-build it with streaming. That also brings the visualisations and the
-waveform seek bar, since both read the audio it is decoding.
+`cargo install` leaves streaming out, so add it to have boombox appear in
+Spotify's device list and play the audio itself. That also brings the
+visualisations and the waveform seek bar, since both read the audio it is
+decoding. (The Homebrew formula does this for you.)
 
 ```console
 cargo install boombox --locked --features streaming
@@ -199,7 +216,8 @@ make install        # cargo install --locked --path … --features streaming
 ```
 
 `make install` prints what it installed and warns when a daemon is still
-running an older build. See [CONTRIBUTING.md](CONTRIBUTING.md).
+running an older build; `make uninstall` removes it again and says what it
+left behind. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Layout
 
