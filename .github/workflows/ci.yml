@@ -67,16 +67,13 @@ jobs:
         with:
           command: check licenses
 
-  # Reports, and deliberately does not block. Every advisory against this
-  # tree today is inside librespot's dependencies, with no newer librespot
-  # to move to -- so a blocking check would fail every run for problems
-  # nobody here can fix, and a CI that is always red stops being read. It
-  # is here to catch the next one, especially in a dependency we chose.
-  # See SECURITY.md. Make it blocking once the librespot subtree is clear.
+  # Blocks, which it can only do because the advisories that cannot be
+  # fixed from here are named in deny.toml. That list is what makes a red
+  # cross mean something: anything not on it is new, and new is what this
+  # is watching for. See SECURITY.md for what is on the list and why.
   advisories:
-    name: Security advisories (report only)
+    name: Security advisories
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2

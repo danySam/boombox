@@ -37,8 +37,11 @@ moves to the current `rustls` generation.
 
 Builds without `--features streaming` do not include any of this.
 
-CI reports advisories on every run but does not fail on them, for the
-reason above. That becomes a blocking check once the tree is clear.
+CI checks advisories on every run and fails on anything not in that list.
+The nine are named individually in `deny.toml`, with a reason each, so a
+tenth stops the build rather than disappearing into a red cross that was
+already red. When librespot moves, the entries that no longer apply
+should be deleted rather than left to rot.
 
 [librespot]: https://github.com/librespot-org/librespot
 
