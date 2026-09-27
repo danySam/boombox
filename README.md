@@ -151,26 +151,55 @@ see the redirect URI; Spotify only checks that after you sign in.
 ## Install
 
 boombox runs on **macOS and Linux**. The daemon talks over Unix sockets, so
-Windows is not supported.
+Windows is not supported. You need **Rust 1.88 or newer** from
+<https://rustup.rs>, and **Spotify Premium** with a developer app of your
+own — `boombox setup` walks you through that part.
 
-You need:
+```console
+cargo install boombox --locked
+boombox setup
+```
 
-- **Rust 1.88 or newer**, from <https://rustup.rs>
-- **Spotify Premium**, and a Spotify developer app of your own, which
-  `boombox setup` walks you through
-- **On Linux, for streaming only:** the ALSA development headers and
-  `pkg-config` — `sudo apt install libasound2-dev pkg-config` on Debian and
-  Ubuntu, `sudo dnf install alsa-lib-devel pkgconf-pkg-config` on Fedora
+That gives you the CLI and the TUI, driving Spotify on your other devices —
+your phone, the desktop app, a speaker.
+
+### With audio on this machine
+
+To have boombox appear in Spotify's device list and play the audio itself,
+build it with streaming. That also brings the visualisations and the
+waveform seek bar, since both read the audio it is decoding.
+
+```console
+cargo install boombox --locked --features streaming
+```
+
+On **Linux** this needs the ALSA headers first, or the build stops with
+`The system library 'alsa' required by crate 'alsa-sys' was not found`:
+
+```console
+sudo apt install libasound2-dev pkg-config        # Debian, Ubuntu
+sudo dnf install alsa-lib-devel pkgconf-pkg-config # Fedora
+```
+
+macOS needs nothing extra. Either way the build takes a couple of minutes,
+mostly librespot.
+
+Streaming is compiled in, not switched on: it also wants a second sign-in,
+which `boombox setup` offers as its last step. Skip it and boombox carries
+on as a controller, saying so once in the daemon log rather than nagging.
+
+### From a checkout
+
+For hacking on it, or to run something newer than the release:
 
 ```console
 git clone https://github.com/danySam/boombox
 cd boombox
-cargo install --locked --path crates/boombox --features streaming
-boombox setup
+make install        # cargo install --locked --path … --features streaming
 ```
 
-Leave out `--features streaming` if you only want to control Spotify on your
-other devices: it builds without ALSA, and without the audio visualisations.
+`make install` prints what it installed and warns when a daemon is still
+running an older build. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Layout
 
