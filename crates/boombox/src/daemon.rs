@@ -212,16 +212,37 @@ enum Staleness {
 ///
 /// Newer rather than merely different, or running an old checkout would
 /// kill a good daemon and replace it with the older code.
-fn staleness(ours: Option<u64>, theirs: Option<u64>, playing_here: bool) -> Staleness {
-    match (ours, theirs) {
-        (Some(ours), Some(theirs)) if ours > theirs => {
-            if playing_here {
-                Staleness::Busy
-            } else {
-                Staleness::Replace
-            }
-        }
-        _ => Staleness::UpToDate,
+fn staleness(ours: &str, theirs: &str, playing_here: bool) -> Staleness {
+    if !newer_than(ours, theirs) {
+        return Staleness::UpToDate;
+    }
+    if playing_here { Staleness::Busy } else { Staleness::Replace }
+}
+
+/// The release out of a string like `0.2.0 #18 (9e18f3cca)`.
+fn release_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split_whitespace().next()?.split('.');
+    let mut next = || parts.next()?.parse().ok();
+    Some((next()?, next()?, next()?))
+}
+
+/// Whether this binary is running later code than the daemon is.
+///
+/// The release decides it; the build number only breaks a tie within one
+/// release. It has to be that way round now that boombox is installed
+/// from places carrying no git history: a Homebrew or crates.io build
+/// reports a bare `0.2.0` and has no number at all, so comparing numbers
+/// alone left two such builds incomparable -- and a 0.2.0 front end sat
+/// talking to a 0.1.0 daemon with nothing to notice it.
+fn newer_than(ours: &str, theirs: &str) -> bool {
+    match (release_version(ours), release_version(theirs)) {
+        (Some(ours), Some(theirs)) if ours != theirs => ours > theirs,
+        // The same release, or two versions neither of us can read: the
+        // build number is all that is left, and only a checkout has one.
+        _ => match (build_number(ours), build_number(theirs)) {
+            (Some(ours), Some(theirs)) => ours > theirs,
+            _ => false,
+        },
     }
 }
 
@@ -1590,13 +1611,12 @@ pub async fn ensure_running(config: &Config) -> (Option<IpcClient>, Startup) {
         // binary is newer, the fixes it carries are not the ones running.
         Probe::Answering(status) if status.speaks_our_protocol() => {
             if let Ok(client) = IpcClient::connect(&path).await {
-                let ours = build_number(&boombox_core::build_info::short());
-                let theirs = build_number(&status.version);
+                let ours = boombox_core::build_info::short();
                 // Asked only when this binary is newer: the common case is
                 // the same build, and that should cost nothing at all.
-                let stale = match staleness(ours, theirs, false) {
+                let stale = match staleness(&ours, &status.version, false) {
                     Staleness::UpToDate => Staleness::UpToDate,
-                    _ => staleness(ours, theirs, playing_on(&client, &status).await),
+                    _ => staleness(&ours, &status.version, playing_on(&client, &status).await),
                 };
                 match stale {
                     Staleness::UpToDate => return (Some(client), Startup::Joined),
@@ -1780,29 +1800,59 @@ mod tests {
     fn a_build_without_a_number_is_never_newer() {
         assert_eq!(build_number("0.1.0 (abc123def)"), None);
         assert_eq!(build_number("0.1.0"), None);
-        assert_eq!(staleness(None, Some(3), false), Staleness::UpToDate);
-        assert_eq!(staleness(Some(18), None, false), Staleness::UpToDate);
+        assert_eq!(staleness("0.1.0", "0.1.0 #3 (a)", false), Staleness::UpToDate);
+        assert_eq!(staleness("0.1.0 #18 (a)", "0.1.0", false), Staleness::UpToDate);
     }
 
     /// The point: installing leaves the old daemon running, and the fixes
     /// just installed are not the code answering.
     #[test]
     fn a_newer_binary_replaces_an_idle_daemon() {
-        assert_eq!(staleness(Some(18), Some(3), false), Staleness::Replace);
+        assert_eq!(staleness("0.1.0 #18 (a)", "0.1.0 #3 (b)", false), Staleness::Replace);
     }
 
     /// Unless it is the one making sound. A restart takes the device away
     /// and brings back a different one.
     #[test]
     fn a_daemon_that_is_playing_is_left_alone() {
-        assert_eq!(staleness(Some(18), Some(3), true), Staleness::Busy);
+        assert_eq!(staleness("0.1.0 #18 (a)", "0.1.0 #3 (b)", true), Staleness::Busy);
     }
 
     /// Running an old checkout must not replace a newer daemon with it.
     #[test]
     fn an_older_binary_never_replaces_a_newer_daemon() {
-        assert_eq!(staleness(Some(3), Some(18), false), Staleness::UpToDate);
-        assert_eq!(staleness(Some(18), Some(18), false), Staleness::UpToDate);
+        assert_eq!(staleness("0.1.0 #3 (a)", "0.1.0 #18 (b)", false), Staleness::UpToDate);
+        assert_eq!(staleness("0.1.0 #18 (a)", "0.1.0 #18 (a)", false), Staleness::UpToDate);
+    }
+
+    /// The case that went unnoticed: installed from Homebrew or crates.io,
+    /// neither of which ships git history, so neither build has a number.
+    #[test]
+    fn a_newer_release_wins_with_no_build_numbers() {
+        assert_eq!(staleness("0.2.0", "0.1.0 #19 (a)", false), Staleness::Replace);
+        assert_eq!(staleness("0.2.0", "0.1.0", false), Staleness::Replace);
+    }
+
+    /// And the release decides it: a development build of an older
+    /// release is still older, however high its number has climbed.
+    #[test]
+    fn a_high_build_number_does_not_beat_a_newer_release() {
+        assert_eq!(staleness("0.1.0 #99 (a)", "0.2.0", false), Staleness::UpToDate);
+    }
+
+    /// Two installs of one release are equal, whoever built them.
+    #[test]
+    fn the_same_release_from_different_places_is_not_newer() {
+        assert_eq!(staleness("0.2.0", "0.2.0", false), Staleness::UpToDate);
+        assert_eq!(staleness("0.2.0", "0.2.0 #21 (a)", false), Staleness::UpToDate);
+    }
+
+    #[test]
+    fn a_version_string_yields_its_release() {
+        assert_eq!(release_version("0.2.0 #18 (9e18f3cca) 2026-09-27"), Some((0, 2, 0)));
+        assert_eq!(release_version("1.10.3"), Some((1, 10, 3)));
+        assert_eq!(release_version("not a version"), None);
+        assert_eq!(release_version(""), None);
     }
 
     /// The dead end this removes: the device is listed, play fails, and

@@ -13,7 +13,15 @@ fn main() {
         println!("cargo:rerun-if-changed=../../{path}");
     }
 
-    println!("cargo:rustc-env=BOOMBOX_COMMIT={}", git(&["rev-parse", "--short=9", "HEAD"]));
+    // A registry build has no git history, but `cargo publish` leaves the
+    // commit behind in `.cargo_vcs_info.json`, so it is still knowable --
+    // unlike the count, which needs history nobody shipped.
+    println!("cargo:rerun-if-changed=.cargo_vcs_info.json");
+    let commit = match git(&["rev-parse", "--short=9", "HEAD"]) {
+        found if !found.is_empty() => found,
+        _ => published_commit(),
+    };
+    println!("cargo:rustc-env=BOOMBOX_COMMIT={commit}");
     println!("cargo:rustc-env=BOOMBOX_BUILD={}", build_number());
     println!(
         "cargo:rustc-env=BOOMBOX_COMMIT_DATE={}",
@@ -48,6 +56,28 @@ fn build_number() -> String {
         return String::new();
     }
     git(&["rev-list", "--count", "HEAD"])
+}
+
+/// The commit cargo wrote down when the crate was published.
+///
+/// Hand-parsed rather than pulling in a JSON crate: this is one string
+/// from a file cargo generates, and a build dependency to read one field
+/// would cost every consumer a compile.
+fn published_commit() -> String {
+    let text = std::fs::read_to_string(".cargo_vcs_info.json").unwrap_or_default();
+    let Some(after_key) = text.split("\"sha1\"").nth(1) else {
+        return String::new();
+    };
+    let Some(open) = after_key.find('"') else {
+        return String::new();
+    };
+    let rest = &after_key[open + 1..];
+    match rest.find('"') {
+        // Shortened to match what `git rev-parse --short=9` gives, so the
+        // two sources of a commit look alike.
+        Some(end) => rest[..end].chars().take(9).collect(),
+        None => String::new(),
+    }
 }
 
 /// Empty when git is missing or this is not a checkout -- a tarball build
