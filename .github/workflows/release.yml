@@ -145,10 +145,30 @@ jobs:
             *) echo "::error::'$reported' carries no build number"; exit 1 ;;
           esac
 
+      # Linux only, and built from the binary above rather than compiled
+      # again. A .deb says what a tarball cannot: that this needs ALSA to
+      # start, and a glibc no older than the one it was built against, so
+      # apt refuses with a sentence instead of letting it install and die
+      # at exec with a loader error.
+      - uses: taiki-e/install-action@v2
+        if: runner.os == 'Linux'
+        with:
+          tool: cargo-deb
+      - name: Debian package
+        if: runner.os == 'Linux'
+        run: |
+          cargo deb --no-build --target ${{ matrix.target }} -p boombox
+          cp target/${{ matrix.target }}/debian/*.deb dist/
+          ls -la dist/*.deb
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.name }}
-          path: dist/*.tar.gz
+          # Both patterns: only the Linux jobs produce the second, and
+          # if-no-files-found fires only when nothing at all matches.
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
           if-no-files-found: error
 
   release:
@@ -170,7 +190,12 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum ./*.tar.gz > SHA256SUMS
+          # nullglob because the matrix does not fail fast: if the Linux
+          # jobs died there are no .deb files, and an unmatched glob would
+          # otherwise arrive as a literal filename and fail this for the
+          # targets that did build.
+          shopt -s nullglob
+          sha256sum ./*.tar.gz ./*.deb > SHA256SUMS
           cat SHA256SUMS
 
       # The notes on this project are written by hand. When the release does
@@ -182,4 +207,5 @@ jobs:
             gh release create "$GITHUB_REF_NAME" --draft \
               --title "boombox ${GITHUB_REF_NAME#v}" \
               --notes "Binaries attached by CI. Notes to follow."
-          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --clobber
+          shopt -s nullglob
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.deb dist/SHA256SUMS --clobber

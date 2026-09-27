@@ -10,6 +10,43 @@ readme = "../../README.md"
 keywords = ["spotify", "tui", "terminal", "music", "cli"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
+# Debian packaging, built by the release workflow from the binaries it has
+# already produced. apt can state what a tarball cannot -- that this needs
+# ALSA to start, and a glibc no older than the one it was built against --
+# so it refuses with a sentence instead of dying at exec with a loader
+# error.
+[package.metadata.deb]
+maintainer = "Dany Sam <danysamsp@gmail.com>"
+section = "sound"
+priority = "optional"
+# Spelled out rather than left to `$auto`, which runs dpkg-shlibdeps on the
+# build host and pins whichever names that host happens to use. ALSA has
+# two: the 64-bit time_t transition renamed libasound2 to libasound2t64, so
+# Ubuntu 22.04 offers only the old name and 24.04 only the new, and a
+# package naming either one alone cannot be installed on the other. The
+# alternative satisfies both from a single package. The glibc floor is
+# measured, not guessed: the binary needs GLIBC_2.34, which means Ubuntu
+# 22.04, Debian 12, RHEL 9 or newer.
+depends = "libc6 (>= 2.34), libgcc-s1, libasound2t64 | libasound2"
+# Without this the whole README becomes the description, because cargo-deb
+# reads the `readme` field, and `apt show boombox` prints two dozen
+# kilobytes of markdown tables and image links.
+extended-description = """
+A terminal client for Spotify: a full-screen player with search, playlists, \
+library and visualisations, and a scriptable CLI over the same core, so \
+`boombox next` in a keybinding and `boombox now --json` in a status line \
+work as well as the interface does.
+Needs Spotify Premium and a Spotify developer app of your own, which \
+`boombox setup` walks through. Not affiliated with Spotify."""
+# Spelled out because naming any assets replaces cargo-deb's defaults, and
+# the defaults leave out the licence texts that a binary release is obliged
+# to carry. `target/release` is rewritten to the --target directory.
+assets = [
+    ["target/release/boombox", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/boombox/", "644"],
+    ["../../THIRD_PARTY_LICENSES.html", "usr/share/doc/boombox/", "644"],
+]
+
 [features]
 default = []
 # Embed librespot so the daemon becomes a Spotify Connect device that decodes
