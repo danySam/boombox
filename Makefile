@@ -1,7 +1,7 @@
 # cargo has no post-build hook, so code signing lives here.
 # See scripts/codesign.sh for why dev builds are signed at all.
 
-.PHONY: build build-streaming release release-streaming install run daemon tui test lint fmt check setup-codesign unsign-teardown
+.PHONY: build build-streaming release release-streaming install uninstall run daemon tui test lint fmt check setup-codesign unsign-teardown
 
 build:
 	cargo build
@@ -41,6 +41,19 @@ install:
 	  echo "note:     the running daemon is still $$running"; \
 	  echo "          \`boombox daemon --stop\` replaces it"; \
 	fi
+
+# `make install` is cargo underneath, so this is too. It says what it has
+# left behind: config and tokens outliving an uninstall is deliberate --
+# reinstalling should not mean signing in again -- but it is worth being
+# told rather than discovering later.
+uninstall:
+	@cargo uninstall boombox || echo "nothing installed by cargo to remove"
+	@echo
+	@echo "left alone, so a reinstall does not mean signing in again:"
+	@echo "  $$HOME/.config/boombox"
+	@echo "  $$HOME/.local/state/boombox"
+	@echo "remove those for a clean slate; 'make unsign-teardown' removes the"
+	@echo "signing certificate, if you ever ran 'make setup-codesign'."
 
 run: build
 	./target/debug/boombox
