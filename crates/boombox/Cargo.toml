@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "A Spotify client for the terminal: a TUI and a scriptable CLI over the same core."
+readme = "../../README.md"
+keywords = ["spotify", "tui", "terminal", "music", "cli"]
+categories = ["command-line-utilities", "multimedia::audio"]
 
 [features]
 default = []

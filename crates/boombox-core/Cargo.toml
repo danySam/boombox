@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Core of boombox: Spotify sign-in over PKCE, a Web API client, and configuration."
 
 [dependencies]
 base64.workspace = true

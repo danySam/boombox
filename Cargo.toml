@@ -11,9 +11,11 @@ repository = "https://github.com/danySam/boombox"
 
 [workspace.dependencies]
 libc = "0.2"
-boombox-core = { path = "crates/boombox-core" }
-boombox-ipc = { path = "crates/boombox-ipc" }
-boombox-tui = { path = "crates/boombox-tui" }
+# Both a path and a version: the path is what a local build uses, the
+# version is what crates.io needs, and publishing is refused without it.
+boombox-core = { path = "crates/boombox-core", version = "0.2.0" }
+boombox-ipc = { path = "crates/boombox-ipc", version = "0.2.0" }
+boombox-tui = { path = "crates/boombox-tui", version = "0.2.0" }
 
 anyhow = "1"
 base64 = "0.22"

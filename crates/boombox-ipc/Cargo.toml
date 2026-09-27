@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Wire protocol spoken between the boombox daemon and its front ends, over a Unix socket."
 
 [dependencies]
 boombox-core.workspace = true
