@@ -14,6 +14,7 @@ sudo dnf install alsa-lib-devel pkgconf-pkg-config # Fedora
 make build            # debug build, without streaming
 make build-streaming  # debug build, with streaming and the visualisations
 make install          # onto your PATH, with streaming
+make uninstall        # remove it again; config and tokens are left alone
 make check            # formatting, clippy and tests
 ```
 

@@ -354,11 +354,13 @@ log and carries on driving your other devices. `boombox daemon --status` says
 which of the two is missing.
 
 ```console
-make build-streaming
-boombox setup                      # offers it as the last step
+make build-streaming               # from a checkout
+boombox setup                      # offers the sign-in as its last step
 ```
 
-`boombox auth login --streaming` does the same on its own. The settings live in
+A Homebrew install has streaming already, and `cargo install` needs
+`--features streaming` — see [Install](#install). The sign-in can also be done
+on its own with `boombox auth login --streaming`. The settings live in
 `config.toml`:
 
 ```toml
