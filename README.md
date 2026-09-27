@@ -162,10 +162,44 @@ brew install danySam/boombox/boombox
 boombox setup
 ```
 
-The shortest route, and the only one that needs nothing installed first:
-Homebrew fetches Rust to build with and drops it afterwards. Streaming is
-included, so boombox appears in Spotify's device list and can play the
-audio itself.
+The shortest route: Homebrew downloads a prebuilt binary, so this takes
+seconds and needs nothing on the machine first. Streaming is included, so
+boombox appears in Spotify's device list and can play the audio itself.
+
+### Prebuilt binaries
+
+Every release carries one tarball per platform, built by CI from the
+tagged commit, with streaming already compiled in:
+
+```console
+tag=v0.2.1 target=aarch64-apple-darwin   # see the release for the rest
+curl -LO https://github.com/danySam/boombox/releases/download/$tag/boombox-$tag-$target.tar.gz
+tar -xzf boombox-$tag-$target.tar.gz
+./boombox-$tag-$target/boombox --version
+```
+
+The names are Rust target triples — `aarch64-apple-darwin`,
+`x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` and
+`aarch64-unknown-linux-gnu`, where `unknown` is the vendor field and not
+a mistake. `SHA256SUMS` covers all four:
+
+```console
+shasum -a 256 -c SHA256SUMS --ignore-missing
+```
+
+On **Linux** the binary links ALSA when it starts and will not run
+without it, so `sudo apt install libasound2` (no `-dev` needed, that is
+only for building). These are built against glibc 2.34, which means
+Ubuntu 22.04, Debian 12, RHEL 9 or newer; on anything older, install
+with cargo instead.
+
+On **macOS** these are not notarised, so a browser download is
+quarantined and Gatekeeper refuses to run it. Fetching with `curl` as
+above avoids that, and Homebrew is unaffected. If you did use a browser:
+
+```console
+xattr -d com.apple.quarantine boombox
+```
 
 ### With cargo
 
@@ -341,7 +375,8 @@ $ tail -f ~/.local/state/boombox/boombox.log
 
 ## Streaming (optional)
 
-Not compiled in unless you ask for it, and on once it is — but only after the
+Already in the Homebrew install and the release binaries; `cargo install`
+leaves it out unless you ask. On once it is there — but only after the
 separate streaming sign-in, which `boombox setup` offers as its last step. The
 daemon then registers with Spotify as a device named after `device_name`, which
 shows up in the picker on your other clients. **Registering is not taking
@@ -358,10 +393,10 @@ make build-streaming               # from a checkout
 boombox setup                      # offers the sign-in as its last step
 ```
 
-A Homebrew install has streaming already, and `cargo install` needs
-`--features streaming` — see [Install](#install). The sign-in can also be done
-on its own with `boombox auth login --streaming`. The settings live in
-`config.toml`:
+The Homebrew install and the release binaries have streaming already, and
+`cargo install` needs `--features streaming` — see [Install](#install).
+The sign-in can also be done on its own with
+`boombox auth login --streaming`. The settings live in `config.toml`:
 
 ```toml
 [streaming]
