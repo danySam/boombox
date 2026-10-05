@@ -678,6 +678,23 @@ fn resume_for(state: Option<&PlaybackState>, ours: &str) -> Option<Resume> {
         .then(|| Resume { id: ours.to_string(), playing: state.is_playing })
 }
 
+/// Whether the device Spotify calls active belongs to somebody else.
+///
+/// Our own ids do not count, and getting that wrong is what stopped the
+/// first version of this restoring anything. Spotify was still naming the
+/// dead device as active 270ms after the session behind it ended -- the
+/// account's state lags the device list by seconds -- so a reconnect read
+/// its own corpse as somebody else's playback and politely declined. The
+/// id being replaced is stale by definition, and the new id is where we
+/// are trying to arrive; neither is a reason to stand aside.
+#[cfg(feature = "streaming")]
+fn taken_by_someone_else(active: Option<&str>, ours: &str, previous: Option<&str>) -> bool {
+    match active {
+        None => false,
+        Some(active) => active != ours && Some(active) != previous,
+    }
+}
+
 /// How an attempt to make this machine's device the active one ended.
 #[cfg(feature = "streaming")]
 #[derive(Debug, PartialEq, Eq)]
@@ -1220,7 +1237,7 @@ impl Daemon {
         if !enabled {
             return;
         }
-        match self.take_when_idle(device_id, false).await {
+        match self.take_when_idle(device_id, false, None).await {
             Took::Yes => tracing::info!("nothing was playing, so {device_name} is now active"),
             other => tracing::debug!("did not adopt {device_name}: {other}"),
         }
@@ -1241,7 +1258,10 @@ impl Daemon {
     /// already had.
     #[cfg(feature = "streaming")]
     async fn resume_here(&self, was: &Resume, device_id: &str, device_name: &str) {
-        let took = self.take_when_idle(device_id, was.playing).await;
+        // The id we are replacing is passed through so the stale state
+        // Spotify serves for a few seconds after a session dies is not
+        // mistaken for somebody else having taken playback.
+        let took = self.take_when_idle(device_id, was.playing, Some(&was.id)).await;
         // At warn, to sit beside the line that announced the drop: a log
         // that says the connection went and never says what became of it
         // is what made this take an investigation to pin down.
@@ -1275,17 +1295,29 @@ impl Daemon {
     /// Found by id: matching on the name would let a second machine called
     /// the same thing be taken instead, moving playback to the wrong
     /// computer.
+    ///
+    /// `previous` is the id this one replaces, when there is one. Spotify
+    /// keeps reporting a dead device as active for a few seconds, and
+    /// without knowing that id this cannot tell that stale answer apart
+    /// from somebody genuinely having taken playback.
     #[cfg(feature = "streaming")]
-    async fn take_when_idle(&self, device_id: &str, play: bool) -> Took {
+    async fn take_when_idle(&self, device_id: &str, play: bool, previous: Option<&str>) -> Took {
         let deadline = Instant::now() + ADOPT_WAIT;
         loop {
             // Re-checked every pass rather than once: the user may well
             // start playing something during the wait, and taking it then
             // would pull it straight back off them.
             match self.client.playback_state().await {
-                Ok(Some(state)) if state.device.is_some() => return Took::Busy,
+                Ok(state) => {
+                    let active = state
+                        .as_ref()
+                        .and_then(|s| s.device.as_ref())
+                        .and_then(|d| d.id.as_deref());
+                    if taken_by_someone_else(active, device_id, previous) {
+                        return Took::Busy;
+                    }
+                }
                 Err(e) => return Took::Failed(format!("cannot tell what is playing: {e}")),
-                _ => {}
             }
 
             if let Ok(devices) = self.client.devices().await
@@ -2055,6 +2087,49 @@ mod tests {
         let mut state = polled_state();
         state.device = None;
         assert_eq!(resume_for(Some(&state), "d"), None, "polled, but no active device");
+    }
+
+    /// Caught on a real reconnect: Spotify was still naming the device
+    /// that had just died as the active one, 270ms after the session
+    /// behind it ended. Reading that as somebody else's playback is what
+    /// made the first attempt at this decline to restore anything.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn the_device_being_replaced_is_not_somebody_else() {
+        assert!(!taken_by_someone_else(Some("old"), "new", Some("old")));
+    }
+
+    /// Nor is the one we are trying to arrive on, which Spotify may report
+    /// as active before the transfer this is about to make.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn the_device_we_are_claiming_is_not_somebody_else() {
+        assert!(!taken_by_someone_else(Some("new"), "new", Some("old")));
+    }
+
+    /// The case the check exists for: a phone picked up during the outage
+    /// keeps playback, and a reconnecting daemon does not pull it away.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn a_device_that_is_neither_of_ours_keeps_playback() {
+        assert!(taken_by_someone_else(Some("someone-elses-phone"), "new", Some("old")));
+    }
+
+    /// Nothing active is free to take, which is the ordinary path for a
+    /// reconnect: the account is left with no active device at all.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn nothing_active_is_not_somebody_else() {
+        assert!(!taken_by_someone_else(None, "new", Some("old")));
+        assert!(!taken_by_someone_else(None, "new", None));
+    }
+
+    /// Adoption has no previous id, so any other device still blocks it --
+    /// the behaviour that setting always had.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn without_a_previous_id_any_other_device_still_blocks() {
+        assert!(taken_by_someone_else(Some("other"), "new", None));
     }
 
     /// The whole point: the figure asked for is the one shown, until the
