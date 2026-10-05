@@ -134,6 +134,13 @@ where
     tracing::info!(protocol = ?app.graphics, "album art");
     app.daemon_version = options.daemon_version.clone();
     app.our_device_id = options.our_device_id.clone();
+    // Before any frames are collected rather than after: the waterfall keeps
+    // one per column, so it has to know how many columns there are. Nothing
+    // resizes a terminal that is already the right size, so waiting for a
+    // resize event would mean waiting forever.
+    if let Ok(size) = terminal.size() {
+        app.set_stage_width(size.width);
+    }
     // Surfaced immediately rather than left for the first request that
     // happens to hit a changed message, which is a baffling way to find out.
     // A real warning wins the one toast slot over a mere notice.
@@ -302,8 +309,13 @@ where
                         }
                     }
                     // The terminal repaints everything on a resize, which
-                    // takes the image with it.
-                    Event::Resize(_, _) => graphics.invalidate(),
+                    // takes the image with it -- and the stage changes
+                    // width, which is how much history the waterfall needs
+                    // to reach its left edge.
+                    Event::Resize(width, _) => {
+                        graphics.invalidate();
+                        app.set_stage_width(width);
+                    }
                     _ => {}
                 }
             },

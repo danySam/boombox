@@ -2358,6 +2358,44 @@ mod tests {
         assert!(text.contains("Aurora"), "which is drawn over the stage");
     }
 
+    /// Reported from a large display: the spectrogram covered about two
+    /// thirds of the screen. The waterfall paints one column per frame of
+    /// history, right-aligned, and the history was capped at 256 frames
+    /// whatever the terminal was -- so a wider pane could never be more
+    /// than 256 columns full, and the rest stayed empty for good.
+    #[test]
+    fn the_spectrogram_fills_a_wide_stage_to_its_left_edge() {
+        // Rows above the legend and the player bar: the stage itself.
+        fn left_edge_drawn(app: &App) -> bool {
+            let text = render(app, 400, 20);
+            let stage = 20 - BAR_HEIGHT as usize - 1;
+            text.lines().take(stage).any(|row| row.starts_with(|c: char| c != ' '))
+        }
+
+        let mut app = playing_app();
+        app.cycle_visual(); // bars
+        app.cycle_visual(); // spectrogram
+        app.set_stage_width(400);
+        for _ in 0..400 {
+            app.set_spectrum(vec![0.9; 64]);
+        }
+        assert!(left_edge_drawn(&app), "a 400-column stage must be drawn all the way across");
+
+        // The old behaviour, so this test is known to be able to fail: a
+        // history held below the width of the pane leaves the left blank.
+        let mut capped = playing_app();
+        capped.cycle_visual();
+        capped.cycle_visual();
+        capped.set_stage_width(256);
+        for _ in 0..400 {
+            capped.set_spectrum(vec![0.9; 64]);
+        }
+        assert!(
+            !left_edge_drawn(&capped),
+            "256 frames cannot reach the left of 400 columns -- the bug being fixed"
+        );
+    }
+
     /// Browsing is a layer, so closing it gives the whole screen back
     /// rather than collapsing a pane.
     #[test]

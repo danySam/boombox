@@ -48,9 +48,19 @@ pub const SCOPE_TRAILS: usize = 5;
 const GAIN_FALL_PER_SEC: f32 = 6.0;
 const GAIN_RISE_PER_SEC: f32 = 0.8;
 
-/// Frames of spectrum history kept for the waterfall. Wider than any sensible
-/// terminal, so the display never runs out of past to draw.
-const HISTORY: usize = 256;
+/// Least spectrum history kept for the waterfall, in frames.
+///
+/// The waterfall paints one column per frame it has, right-aligned, so the
+/// history is the widest pane it can fill: anything beyond it stays blank.
+/// A fixed 256 used to be the whole story, on the grounds that it was
+/// "wider than any sensible terminal" -- which a large display disproved by
+/// leaving the left third of the spectrogram empty. The cap now follows the
+/// terminal (see [`App::set_stage_width`]) and this is only the floor, for
+/// before a width is known.
+///
+/// At one frame per 33ms a wider pane is also a longer memory: 256 frames is
+/// about eight seconds, and a 400-column terminal holds thirteen.
+const MIN_HISTORY: usize = 256;
 
 /// Index of the first rising zero crossing within `limit`, or 0.
 ///
@@ -390,6 +400,9 @@ pub struct App {
     pub smoothed: Vec<f32>,
     /// Recent frames, oldest first, for the waterfall.
     pub history: std::collections::VecDeque<Vec<f32>>,
+    /// How many of those to keep: as many as the stage is wide, so the
+    /// waterfall can reach the left edge whatever the terminal is doing.
+    history_cap: usize,
     pub visual: Option<VisualMode>,
     /// Derived from the current track, so every visualisation agrees and the
     /// display changes when the music does.
@@ -500,6 +513,7 @@ impl App {
             peaks: Vec::new(),
             smoothed: Vec::new(),
             history: std::collections::VecDeque::new(),
+            history_cap: MIN_HISTORY,
             visual: None,
             palette: Palette::default(),
             cover: None,
@@ -646,6 +660,19 @@ impl App {
         self.entry_index = self.entry_index.min(self.entries.len().saturating_sub(1));
     }
 
+    /// Tells the app how wide the stage is, so the waterfall can fill it.
+    ///
+    /// The spectrogram draws one column per frame of history, so a history
+    /// shorter than the pane is wide leaves a blank band down its left.
+    /// Called once the terminal size is known and again on every resize.
+    ///
+    /// Only ever grows the memory a wide terminal actually needs; the
+    /// surplus is dropped a frame later by [`Self::set_spectrum`], which is
+    /// the one place history is pruned.
+    pub fn set_stage_width(&mut self, width: u16) {
+        self.history_cap = (width as usize).max(MIN_HISTORY);
+    }
+
     pub fn set_spectrum(&mut self, bands: Vec<f32>) {
         // Decay against wall-clock rather than frame count: a stalled or
         // resized terminal must not change how fast the peaks fall.
@@ -680,7 +707,7 @@ impl App {
         // removes.
         if !bands.is_empty() {
             self.history.push_back(bands.clone());
-            while self.history.len() > HISTORY {
+            while self.history.len() > self.history_cap {
                 self.history.pop_front();
             }
         }
@@ -2881,13 +2908,57 @@ pub(crate) mod tests {
     #[test]
     fn history_accumulates_newest_last_and_is_capped() {
         let mut app = App::new(5, false);
-        for i in 0..(HISTORY + 40) {
+        for i in 0..(MIN_HISTORY + 40) {
             app.set_spectrum(vec![i as f32 / 1000.0]);
         }
-        assert_eq!(app.history.len(), HISTORY, "history must not grow without bound");
+        assert_eq!(app.history.len(), MIN_HISTORY, "history must not grow without bound");
         let newest = app.history.back().unwrap()[0];
         let oldest = app.history.front().unwrap()[0];
         assert!(newest > oldest, "newest frame belongs at the back");
+    }
+
+    /// The bug this replaced: on a terminal wider than the old fixed 256
+    /// frames, the waterfall could only ever reach 256 columns in from the
+    /// right, so the left of a large screen stayed blank however long it
+    /// played.
+    #[test]
+    fn a_wide_stage_keeps_enough_history_to_reach_its_left_edge() {
+        let mut app = App::new(5, false);
+        app.set_stage_width(400);
+        for i in 0..500 {
+            app.set_spectrum(vec![i as f32 / 1000.0]);
+        }
+        assert_eq!(app.history.len(), 400, "one frame per column, the full width");
+    }
+
+    /// A narrow terminal does not shrink the history below the floor: the
+    /// cap is there to let a wide pane fill, not to starve a small one.
+    #[test]
+    fn a_narrow_stage_still_keeps_the_floor() {
+        let mut app = App::new(5, false);
+        app.set_stage_width(80);
+        for i in 0..(MIN_HISTORY + 40) {
+            app.set_spectrum(vec![i as f32 / 1000.0]);
+        }
+        assert_eq!(app.history.len(), MIN_HISTORY);
+    }
+
+    /// Widening mid-track must fill the new space rather than leave the
+    /// gap the resize opened up.
+    #[test]
+    fn widening_the_terminal_lets_the_history_grow_into_it() {
+        let mut app = App::new(5, false);
+        app.set_stage_width(80);
+        for i in 0..400 {
+            app.set_spectrum(vec![i as f32 / 1000.0]);
+        }
+        assert_eq!(app.history.len(), MIN_HISTORY, "capped while narrow");
+
+        app.set_stage_width(500);
+        for i in 0..500 {
+            app.set_spectrum(vec![i as f32 / 1000.0]);
+        }
+        assert_eq!(app.history.len(), 500, "and grows once there is room");
     }
 
     #[test]
