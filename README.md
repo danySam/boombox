@@ -172,7 +172,7 @@ Every release carries one tarball per platform, built by CI from the
 tagged commit, with streaming already compiled in:
 
 ```console
-tag=v0.2.1 target=aarch64-apple-darwin   # see the release for the rest
+tag=v0.2.2 target=aarch64-apple-darwin   # see the release for the rest
 curl -LO https://github.com/danySam/boombox/releases/download/$tag/boombox-$tag-$target.tar.gz
 tar -xzf boombox-$tag-$target.tar.gz
 ./boombox-$tag-$target/boombox --version

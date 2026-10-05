@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/boombox-core", "crates/boombox-ipc", "crates/boombox-tui", "crates/boombox"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -13,9 +13,9 @@ repository = "https://github.com/danySam/boombox"
 libc = "0.2"
 # Both a path and a version: the path is what a local build uses, the
 # version is what crates.io needs, and publishing is refused without it.
-boombox-core = { path = "crates/boombox-core", version = "0.2.1" }
-boombox-ipc = { path = "crates/boombox-ipc", version = "0.2.1" }
-boombox-tui = { path = "crates/boombox-tui", version = "0.2.1" }
+boombox-core = { path = "crates/boombox-core", version = "0.2.2" }
+boombox-ipc = { path = "crates/boombox-ipc", version = "0.2.2" }
+boombox-tui = { path = "crates/boombox-tui", version = "0.2.2" }
 
 anyhow = "1"
 base64 = "0.22"
