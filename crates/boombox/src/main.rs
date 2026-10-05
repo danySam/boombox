@@ -266,14 +266,22 @@ fn into_player_command(command: Command) -> PlayerCommand {
     }
 }
 
-/// Warnings from everything, except the audio decoders.
+/// Warnings from everything, our own information, and nothing from the
+/// audio decoders.
 ///
 /// One track that librespot could not decrypt had symphonia write 1,752
 /// lines about junk bytes and bad frame headers in ten minutes -- every one
 /// of them about audio nothing could be done with, and none of them
 /// actionable. Their errors still come through, and BOOMBOX_LOG overrides
 /// all of it.
-const DEFAULT_LOG_FILTER: &str = "warn,\
+///
+/// Our own crates sit at info because a daemon's log is read afterwards,
+/// to answer what happened: at plain `warn` it recorded a streaming
+/// connection dropping and then never said whether it came back. There are
+/// a handful of these lines and almost all are one-shot, so the log stays
+/// readable. The directive matches by prefix, so it covers `boombox_core`
+/// and the rest alongside `boombox` itself.
+const DEFAULT_LOG_FILTER: &str = "warn,boombox=info,\
      symphonia=error,symphonia_bundle_flac=error,symphonia_bundle_mp3=error,\
      symphonia_codec_vorbis=error,symphonia_core=error,symphonia_format_ogg=error,\
      symphonia_metadata=error,symphonia_utils_xiph=error";
@@ -310,6 +318,8 @@ mod tests {
         let rendered = filter.to_string();
         assert!(rendered.contains("symphonia_bundle_mp3=error"), "{rendered}");
         assert!(rendered.contains("symphonia_core=error"), "{rendered}");
+        // What a reconnect reports is only in the log if this survives.
+        assert!(rendered.contains("boombox=info"), "{rendered}");
     }
 
     /// Diagnosing a daemon means placing events in time; a crash report of

@@ -654,6 +654,56 @@ fn initial_streaming_state() -> StreamingState {
     }
 }
 
+/// What this machine's device was doing when its session died.
+#[cfg(feature = "streaming")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Resume {
+    /// The id about to disappear. Kept for the log: a device id that
+    /// changes is the one fact that makes a reconnect legible afterwards.
+    id: String,
+    /// Whether Spotify was playing, as against paused on this device.
+    playing: bool,
+}
+
+/// What to put back after a reconnect, from the last state seen before the
+/// session died.
+///
+/// `None` unless this machine held playback, which is what stops a
+/// reconnect reaching for a device that was never ours.
+#[cfg(feature = "streaming")]
+fn resume_for(state: Option<&PlaybackState>, ours: &str) -> Option<Resume> {
+    let state = state?;
+    let device = state.device.as_ref()?;
+    (device.id.as_deref() == Some(ours))
+        .then(|| Resume { id: ours.to_string(), playing: state.is_playing })
+}
+
+/// How an attempt to make this machine's device the active one ended.
+#[cfg(feature = "streaming")]
+#[derive(Debug, PartialEq, Eq)]
+enum Took {
+    /// Spotify accepted the transfer.
+    Yes,
+    /// Something was already playing, so it was left where it was.
+    Busy,
+    /// Spotify never listed the device before the deadline.
+    Absent,
+    /// Spotify refused, or could not be asked.
+    Failed(String),
+}
+
+#[cfg(feature = "streaming")]
+impl std::fmt::Display for Took {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Yes => f.write_str("done"),
+            Self::Busy => f.write_str("something else is playing"),
+            Self::Absent => f.write_str("Spotify never listed the device"),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 #[cfg(feature = "streaming")]
 async fn supervise_streaming(
     daemon: &Arc<Daemon>,
@@ -662,6 +712,11 @@ async fn supervise_streaming(
 ) {
     let mut backoff = RECONNECT_FIRST;
     let mut first = true;
+    // Carried from the session that died to the one that replaces it. A
+    // reconnect registers a new device id and leaves the account with no
+    // active device at all, so without this the music stops and waits to
+    // be told where to go.
+    let mut resume: Option<Resume> = None;
     loop {
         match crate::streaming::start(config).await {
             Ok(mut handle) => {
@@ -669,7 +724,11 @@ async fn supervise_streaming(
                     println!("advertising as a Connect device: {}", handle.device_name());
                     first = false;
                 } else {
-                    tracing::info!("reconnected as {}", handle.device_name());
+                    tracing::info!(
+                        device = %handle.device_id(),
+                        "reconnected as {}",
+                        handle.device_name()
+                    );
                 }
                 *daemon.spectrum.write().await = Some(handle.tap());
                 *daemon.device_id.write().await = Some(handle.device_id().to_string());
@@ -685,7 +744,15 @@ async fn supervise_streaming(
                     let id = handle.device_id().to_string();
                     let name = handle.device_name().to_string();
                     let adopt = config.daemon.adopt_playback;
-                    async move { daemon.adopt_if_idle(&id, &name, adopt).await }
+                    // Taken, so a session that later ends without us
+                    // holding playback does not restore a second time.
+                    let resume = resume.take();
+                    async move {
+                        match resume {
+                            Some(was) => daemon.resume_here(&was, &id, &name).await,
+                            None => daemon.adopt_if_idle(&id, &name, adopt).await,
+                        }
+                    }
                 });
 
                 tokio::select! {
@@ -708,6 +775,16 @@ async fn supervise_streaming(
                                 "the session ended; reconnecting"
                             }
                         };
+                        // Read before the id is cleared, and from the last
+                        // poll rather than asked for now: the question is
+                        // what was true before the session died, and the
+                        // account has no active device left to answer it
+                        // with.
+                        resume = {
+                            let polled = daemon.cache.read().await;
+                            resume_for(polled.playback.as_ref(), handle.device_id())
+                        };
+
                         // Ends the player as well as the protocol task. A
                         // player left running against a dead session is
                         // exactly what fed the decoder undecrypted audio.
@@ -1138,31 +1215,76 @@ impl Daemon {
     /// interfere with. Transfers with `play = false`, because adopting
     /// decides where sound would come from and is not a licence to start
     /// making some.
-    ///
-    /// Waits for the device to show up, because librespot returning a
-    /// handle is not the same as Spotify having listed it -- the first
-    /// attempt reliably finds nothing. This runs in the background, so the
-    /// wait costs no one anything.
-    ///
-    /// Found by id: matching on the name would let a second machine called
-    /// the same thing be adopted instead, moving playback to the wrong
-    /// computer. The name is only for saying what happened.
     #[cfg(feature = "streaming")]
     async fn adopt_if_idle(&self, device_id: &str, device_name: &str, enabled: bool) {
         if !enabled {
             return;
         }
+        match self.take_when_idle(device_id, false).await {
+            Took::Yes => tracing::info!("nothing was playing, so {device_name} is now active"),
+            other => tracing::debug!("did not adopt {device_name}: {other}"),
+        }
+    }
+
+    /// Puts playback back after a reconnect, on the device that replaced
+    /// the one that died.
+    ///
+    /// Only reached when this machine held playback until the session
+    /// broke, and it still declines if anything has taken playback since:
+    /// this is for picking up what was dropped, never for pulling music
+    /// off a phone someone has moved to. `play` follows what was true
+    /// before, so a device that was paused comes back paused.
+    ///
+    /// Deliberately not governed by `adopt_playback`. That setting answers
+    /// whether an idle daemon may make itself active, which is a question
+    /// about starting up; this is about not silently losing what the user
+    /// already had.
+    #[cfg(feature = "streaming")]
+    async fn resume_here(&self, was: &Resume, device_id: &str, device_name: &str) {
+        let took = self.take_when_idle(device_id, was.playing).await;
+        // At warn, to sit beside the line that announced the drop: a log
+        // that says the connection went and never says what became of it
+        // is what made this take an investigation to pin down.
+        match &took {
+            Took::Yes if was.playing => tracing::warn!(
+                was = %was.id, now = %device_id,
+                "reconnected and resumed playback on {device_name}"
+            ),
+            Took::Yes => tracing::warn!(
+                was = %was.id, now = %device_id,
+                "reconnected; {device_name} is active again, still paused"
+            ),
+            Took::Busy => tracing::warn!(
+                was = %was.id, now = %device_id,
+                "reconnected, but something else is playing now, so it was left alone"
+            ),
+            other => tracing::warn!(
+                was = %was.id, now = %device_id,
+                "reconnected as {device_name}, but playback was not restored: {other}"
+            ),
+        }
+    }
+
+    /// Waits for `device_id` to be listed, then makes it the active device
+    /// unless something else is playing by the time it appears.
+    ///
+    /// Waits because librespot returning a handle is not the same as
+    /// Spotify having listed it -- the first attempt reliably finds
+    /// nothing. Runs in the background, so the wait costs no one anything.
+    ///
+    /// Found by id: matching on the name would let a second machine called
+    /// the same thing be taken instead, moving playback to the wrong
+    /// computer.
+    #[cfg(feature = "streaming")]
+    async fn take_when_idle(&self, device_id: &str, play: bool) -> Took {
         let deadline = Instant::now() + ADOPT_WAIT;
         loop {
             // Re-checked every pass rather than once: the user may well
-            // start playing something during the wait, and adopting then
-            // would take it straight back off them.
+            // start playing something during the wait, and taking it then
+            // would pull it straight back off them.
             match self.client.playback_state().await {
-                Ok(Some(state)) if state.device.is_some() => return,
-                Err(e) => {
-                    tracing::debug!("cannot tell whether anything is playing: {e}");
-                    return;
-                }
+                Ok(Some(state)) if state.device.is_some() => return Took::Busy,
+                Err(e) => return Took::Failed(format!("cannot tell what is playing: {e}")),
                 _ => {}
             }
 
@@ -1170,18 +1292,14 @@ impl Daemon {
                 && let Some(device) = devices.iter().find(|d| d.id.as_deref() == Some(device_id))
                 && let Some(id) = device.id.as_deref()
             {
-                match self.client.transfer(id, false).await {
-                    Ok(()) => {
-                        tracing::info!("nothing was playing, so {device_name} is now active");
-                    }
-                    Err(e) => tracing::debug!("could not adopt {device_name}: {e}"),
-                }
-                return;
+                return match self.client.transfer(id, play).await {
+                    Ok(()) => Took::Yes,
+                    Err(e) => Took::Failed(format!("{e}")),
+                };
             }
 
             if Instant::now() >= deadline {
-                tracing::debug!("{device_name} never appeared; not adopting");
-                return;
+                return Took::Absent;
             }
             tokio::time::sleep(ADOPT_POLL).await;
         }
@@ -1895,6 +2013,48 @@ mod tests {
 
     fn polled_state() -> PlaybackState {
         serde_json::from_str(POLLED).unwrap()
+    }
+
+    /// The incident this exists for: the connection dropped while this
+    /// machine was playing, the reconnect registered a different device id,
+    /// and playback was left with nowhere to go until someone picked the
+    /// device by hand.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn a_session_that_died_playing_here_is_resumed_playing() {
+        let resume = resume_for(Some(&polled_state()), "d");
+        assert_eq!(resume, Some(Resume { id: "d".into(), playing: true }));
+    }
+
+    /// Paused is a state worth keeping too -- the device belongs back where
+    /// it was -- but coming back from a dropped connection is no reason to
+    /// start making noise at someone.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn a_session_that_died_paused_here_comes_back_paused() {
+        let mut state = polled_state();
+        state.is_playing = false;
+        let resume = resume_for(Some(&state), "d");
+        assert_eq!(resume, Some(Resume { id: "d".into(), playing: false }));
+    }
+
+    /// Someone listening on their phone when our session dies must keep
+    /// listening on their phone. A reconnect restores what it lost; it does
+    /// not go looking for playback that was never here.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn playback_on_another_device_is_not_ours_to_take_back() {
+        assert_eq!(resume_for(Some(&polled_state()), "some-other-device"), None);
+    }
+
+    /// Nothing active, or nothing polled yet, leaves nothing to put back.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn with_nothing_active_there_is_nothing_to_restore() {
+        assert_eq!(resume_for(None, "d"), None, "no state polled");
+        let mut state = polled_state();
+        state.device = None;
+        assert_eq!(resume_for(Some(&state), "d"), None, "polled, but no active device");
     }
 
     /// The whole point: the figure asked for is the one shown, until the
