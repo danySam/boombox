@@ -176,7 +176,10 @@ impl Sink for TappedSink {
 /// [`Streaming::shutdown`] so librespot deregisters cleanly and Spotify does
 /// not leave a ghost device in the picker.
 pub struct Streaming {
-    spirc: Spirc,
+    /// Behind an `Arc` so the daemon can hold the same handle: pausing the
+    /// player this process is running needs no Spotify round trip, which is
+    /// the one control path that still works when the Web API will not.
+    spirc: Arc<Spirc>,
     device_name: String,
     device_id: String,
     tap: Arc<SpectrumTap>,
@@ -200,6 +203,13 @@ impl Streaming {
     /// even when someone runs boombox under the same name on two machines.
     pub fn device_id(&self) -> &str {
         &self.device_id
+    }
+
+    /// Shared handle to the Connect player, for the controls that need no
+    /// Web API call: this process owns the audio, so pausing it is a local
+    /// matter whatever Spotify's rate limiter happens to be doing.
+    pub fn spirc(&self) -> Arc<Spirc> {
+        Arc::clone(&self.spirc)
     }
 
     /// Shared handle to the audio tap, so the daemon can serve spectrum
@@ -336,7 +346,14 @@ pub async fn start(config: &Config) -> Result<Streaming> {
     // goes silent. The handle is kept so its ending can be noticed.
     let task = tokio::spawn(spirc_task);
 
-    Ok(Streaming { spirc, device_name: name, device_id, tap, session: watched, task: Some(task) })
+    Ok(Streaming {
+        spirc: Arc::new(spirc),
+        device_name: name,
+        device_id,
+        tap,
+        session: watched,
+        task: Some(task),
+    })
 }
 
 #[cfg(test)]

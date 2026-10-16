@@ -40,6 +40,7 @@ const UNSAID_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// The longest a reconnect will sit out a cooldown before giving up on
 /// putting playback back.
+#[cfg(feature = "streaming")]
 const RESUME_WAIT_MAX: Duration = Duration::from_secs(300);
 
 /// How long after a cooldown the poller stays slow.
@@ -110,6 +111,15 @@ pub struct Daemon {
     /// reconnected with a fresh tap, and a `OnceLock` would leave the
     /// daemon serving spectrum data from the session that died.
     spectrum: Arc<RwLock<Option<Arc<crate::spectrum::SpectrumTap>>>>,
+    /// The Connect player this process is running, when there is one.
+    ///
+    /// Held so pause and resume can go straight to it. Those are the
+    /// controls people reach for first, and routing them through the Web
+    /// API meant a rate limit took away the ability to stop audio coming
+    /// out of this very machine -- which is how 8 October ended with the
+    /// daemon being killed to get silence.
+    #[cfg(feature = "streaming")]
+    spirc: Arc<RwLock<Option<Arc<librespot::connect::Spirc>>>>,
     /// Whether a Connect device is registered right now, and if not, why.
     /// The daemon can be perfectly healthy while there is none.
     streaming_state: Arc<RwLock<StreamingState>>,
@@ -295,6 +305,22 @@ fn newer_than(ours: &str, theirs: &str) -> bool {
 ///
 /// A device the caller chose is left alone. `boombox connect kitchen`
 /// followed by a play means the kitchen, even if the kitchen is asleep.
+/// Whether a play request means "carry on with what is loaded" rather than
+/// "start this".
+///
+/// Only the first can be answered by the local player. A request naming a
+/// track, a context, a position or a device is asking for something it does
+/// not already have, and quietly resuming instead would drop what was asked
+/// for -- a worse failure than the rate limit being dodged.
+#[cfg(feature = "streaming")]
+fn resumes_in_place(opts: &PlayOptions) -> bool {
+    opts.context_uri.is_none()
+        && opts.uris.is_empty()
+        && opts.offset.is_none()
+        && opts.position_ms.is_none()
+        && opts.device_id.is_none()
+}
+
 fn play_here(opts: &PlayOptions, ours: Option<&str>) -> Option<PlayOptions> {
     if opts.device_id.is_some() {
         return None;
@@ -443,6 +469,8 @@ pub async fn run(config: &Config) -> Result<()> {
         cooldown: Arc::new(RwLock::new(None)),
         #[cfg(feature = "streaming")]
         spectrum: Arc::new(RwLock::new(None)),
+        #[cfg(feature = "streaming")]
+        spirc: Arc::new(RwLock::new(None)),
         streaming_state: Arc::new(RwLock::new(initial_streaming_state())),
         #[cfg(feature = "streaming")]
         envelope: Arc::new(RwLock::new(crate::spectrum::Envelope::new(ENVELOPE_BUCKETS))),
@@ -829,6 +857,7 @@ async fn supervise_streaming(
                     );
                 }
                 *daemon.spectrum.write().await = Some(handle.tap());
+                *daemon.spirc.write().await = Some(handle.spirc());
                 *daemon.device_id.write().await = Some(handle.device_id().to_string());
                 *daemon.streaming_state.write().await = StreamingState::Live;
                 backoff = RECONNECT_FIRST;
@@ -890,6 +919,9 @@ async fn supervise_streaming(
                         *daemon.streaming_state.write().await =
                             StreamingState::Unavailable(why.into());
                         *daemon.spectrum.write().await = None;
+                        // A player whose session has died cannot be driven,
+                        // and the replacement brings its own handle.
+                        *daemon.spirc.write().await = None;
                         // The next session registers a new id, and until it
                         // does we have no device: an id left behind here
                         // would be another machine's to match.
@@ -898,6 +930,7 @@ async fn supervise_streaming(
                     _ = shutdown.changed() => {
                         handle.shutdown();
                         *daemon.streaming_state.write().await = StreamingState::Disabled;
+                        *daemon.spirc.write().await = None;
                         *daemon.device_id.write().await = None;
                         return;
                     }
@@ -1269,6 +1302,13 @@ impl Daemon {
     /// only thing another request can achieve is to be refused. Saying so
     /// with the time left beats spending a request to be told.
     async fn forward(&self, request: Request) -> Result<Response, Error> {
+        // Tried before the cooldown is consulted, on purpose: this path
+        // makes no Web API call, and the whole point of it is to keep
+        // working when the Web API will not.
+        #[cfg(feature = "streaming")]
+        if let Some(done) = self.on_our_own_player(&request).await {
+            return done;
+        }
         if let Some((left, reason)) = self.cooldown_left().await {
             return Err(Error::RateLimited { retry_after_secs: Some(left.as_secs()), reason });
         }
@@ -1280,6 +1320,56 @@ impl Daemon {
             self.begin_cooldown(wait, reason.clone()).await;
         }
         result
+    }
+
+    /// Whether the device Spotify last reported as active is this one.
+    ///
+    /// Read from the last poll, which is the only answer available when the
+    /// Web API is refusing to give a fresher one -- and refusing is exactly
+    /// when this matters. A stale yes is cheap to be wrong about: the local
+    /// player is paused or resumed and Spotify is told by the Connect
+    /// session, which is a different channel from the one being limited.
+    #[cfg(feature = "streaming")]
+    async fn playback_is_ours(&self) -> bool {
+        let Some(ours) = self.device_id.read().await.clone() else {
+            return false;
+        };
+        let cache = self.cache.read().await;
+        cache.playback.as_ref().and_then(|s| s.device.as_ref()).and_then(|d| d.id.as_deref())
+            == Some(ours.as_str())
+    }
+
+    /// Pause or resume on the player this process is running, if that is
+    /// where the music is.
+    ///
+    /// `None` when it is not ours to do: another device owns playback,
+    /// there is no local player, or the request names something to play,
+    /// which is a different operation from resuming what is loaded.
+    ///
+    /// This is the answer to a rate limit taking away the ability to stop
+    /// audio coming out of this machine. The audio never went through the
+    /// Web API; only the command to stop it did.
+    #[cfg(feature = "streaming")]
+    async fn on_our_own_player(&self, request: &Request) -> Option<Result<Response, Error>> {
+        let resume = match request {
+            Request::Pause => false,
+            Request::Play(opts) if resumes_in_place(opts) => true,
+            _ => return None,
+        };
+        if !self.playback_is_ours().await {
+            return None;
+        }
+        let spirc = self.spirc.read().await.clone()?;
+        Some(match if resume { spirc.play() } else { spirc.pause() } {
+            Ok(()) => {
+                tracing::debug!(resume, "answered by the local player, without asking Spotify");
+                Ok(Response::Unit)
+            }
+            // Not retried through the Web API. A local player that refuses
+            // is a player whose session is going, and spending a request to
+            // be told the same thing is what this exists to avoid.
+            Err(e) => Err(Error::Api { status: 0, message: format!("local player: {e}") }),
+        })
     }
 
     async fn send_to_spotify(&self, request: Request) -> Result<Response, Error> {
@@ -2369,6 +2459,36 @@ mod tests {
         assert!(daemon.cooldown_left().await.is_none(), "nor once it is over");
     }
 
+    /// A bare `play` is "carry on", and that the local player can answer
+    /// without Spotify.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn a_play_with_nothing_named_is_a_resume() {
+        assert!(resumes_in_place(&PlayOptions::resume()));
+    }
+
+    /// Anything naming what to play is not. Resuming instead would drop the
+    /// track that was asked for, which is a worse failure than the rate
+    /// limit this path exists to dodge.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn a_play_that_names_something_is_not_a_resume() {
+        let track = PlayOptions { uris: vec!["spotify:track:x".into()], ..PlayOptions::resume() };
+        assert!(!resumes_in_place(&track), "an explicit track");
+
+        let context =
+            PlayOptions { context_uri: Some("spotify:album:x".into()), ..PlayOptions::resume() };
+        assert!(!resumes_in_place(&context), "an album or playlist");
+
+        let seeked = PlayOptions { position_ms: Some(30_000), ..PlayOptions::resume() };
+        assert!(!resumes_in_place(&seeked), "a position to start from");
+
+        // An explicitly chosen device is explicit routing, even when the
+        // device chosen happens to be this one.
+        let elsewhere = PlayOptions { device_id: Some("other".into()), ..PlayOptions::resume() };
+        assert!(!resumes_in_place(&elsewhere), "a device named by the caller");
+    }
+
     /// Nothing active, or nothing polled yet, leaves nothing to put back.
     #[cfg(feature = "streaming")]
     #[test]
@@ -2520,6 +2640,8 @@ mod tests {
             cooldown: Arc::new(RwLock::new(None)),
             #[cfg(feature = "streaming")]
             spectrum: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "streaming")]
+            spirc: Arc::new(RwLock::new(None)),
             streaming_state: Arc::new(RwLock::new(initial_streaming_state())),
             #[cfg(feature = "streaming")]
             envelope: Arc::new(RwLock::new(crate::spectrum::Envelope::new(ENVELOPE_BUCKETS))),
