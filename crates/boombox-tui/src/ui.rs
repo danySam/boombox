@@ -11,6 +11,13 @@ use crate::palette::Palette;
 const ACCENT: Color = Color::Green;
 const DIM: Color = Color::DarkGray;
 
+/// The pause mark's off-phase: as many spaces as the mark takes columns.
+///
+/// Spelled out rather than assumed, and checked by a test that renders
+/// both phases and compares them, because a mark that is two columns wide
+/// and a blank that is one would shuffle the whole line twice a second.
+const BLANK_MARK: &str = " ";
+
 /// How the row under the cursor is drawn.
 ///
 /// The foreground is set as well as the background, and that is the point.
@@ -471,7 +478,15 @@ fn player_bar(frame: &mut Frame, area: Rect, app: &App, state: Option<&PlaybackS
     };
 
     let item = state.item.as_ref();
-    let glyph = if state.is_playing { "\u{25b6}" } else { "\u{23f8}" };
+    // Paused, the mark pulses rather than sitting still, so a stopped
+    // player is obvious from across the room instead of needing the glyph
+    // read. Blanked rather than dimmed, and to exactly its own width, so
+    // nothing beside it moves as it goes.
+    let glyph = match (state.is_playing, app.blink_shown()) {
+        (true, _) => "\u{25b6}",
+        (false, true) => "\u{23f8}",
+        (false, false) => BLANK_MARK,
+    };
 
     // Words need roughly twice what the icons do; below this the title has
     // nothing left, so the icons come back.
@@ -1573,6 +1588,52 @@ mod tests {
             duration_ms: None,
             kind: boombox_core::api::EntryKind::Artist,
         }
+    }
+
+    /// Blanked rather than dimmed, so the blank has to be exactly as wide
+    /// as the mark: one column against two would shuffle everything beside
+    /// it twice a second.
+    #[test]
+    fn the_blank_is_the_width_of_the_pause_mark() {
+        assert_eq!(Span::raw("\u{23f8}").width(), Span::raw(BLANK_MARK).width());
+    }
+
+    /// And the same thing proved through an actual frame, since the width
+    /// that matters is the one the terminal gives the glyph.
+    #[test]
+    fn the_pause_mark_blinks_without_moving_the_line() {
+        let drawn = |shown: bool| {
+            let mut app = App::new(5, true);
+            app.set_playback(Some(crate::app::tests::playing_state(62, false, false)));
+            if !shown {
+                // One phase into the past, which is the half that hides it.
+                app.blink_epoch = app
+                    .blink_epoch
+                    .checked_sub(crate::app::BLINK_PHASE)
+                    .expect("the clock has been running longer than one phase");
+            }
+            render(&app, 100, 16)
+        };
+        let (shown, hidden) = (drawn(true), drawn(false));
+
+        assert!(shown.contains('\u{23f8}'), "the shown half draws the mark:\n{shown}");
+        assert!(!hidden.contains('\u{23f8}'), "the hidden half does not:\n{hidden}");
+        for (a, b) in shown.lines().zip(hidden.lines()) {
+            assert_eq!(a.chars().count(), b.chars().count(), "a line moved:\n{a}\n{b}");
+        }
+    }
+
+    /// Only while paused. A playing or idle TUI with nothing outstanding
+    /// has to keep sleeping rather than waking twice a second to redraw a
+    /// frame that has not changed.
+    #[test]
+    fn only_a_paused_player_asks_to_be_woken_for_the_blink() {
+        let mut app = App::new(5, true);
+        app.set_playback(Some(crate::app::tests::playing_state(62, false, true)));
+        assert_eq!(app.next_deadline(), None, "playing: nothing to wake for");
+
+        app.set_playback(Some(crate::app::tests::playing_state(62, false, false)));
+        assert!(app.next_deadline().is_some(), "paused: the mark has to change");
     }
 
     /// Reported from a real terminal: the artist on the selected row was

@@ -48,6 +48,13 @@ pub const SCOPE_TRAILS: usize = 5;
 const GAIN_FALL_PER_SEC: f32 = 6.0;
 const GAIN_RISE_PER_SEC: f32 = 0.8;
 
+/// How long the pause mark spends shown, and then hidden.
+///
+/// Slow enough to read as a deliberate pulse. Much quicker and it is a
+/// flicker, which is a hard thing to sit beside while deciding what to
+/// play next.
+pub(crate) const BLINK_PHASE: Duration = Duration::from_millis(600);
+
 /// Least spectrum history kept for the waterfall, in frames.
 ///
 /// The waterfall paints one column per frame it has, right-aligned, so the
@@ -423,6 +430,10 @@ pub struct App {
     pub scope_trails: std::collections::VecDeque<Vec<f32>>,
     scope_gain: f32,
     scope_at: Instant,
+    /// Where the pause pulse counts from. Fixed at startup rather than at
+    /// the moment of pausing, so the mark keeps one steady rhythm instead
+    /// of restarting every time playback stops.
+    pub(crate) blink_epoch: Instant,
     /// Peak amplitude across the current track, for the seek bar.
     pub envelope: Vec<f32>,
     spectrum_at: Instant,
@@ -523,6 +534,7 @@ impl App {
             scope_trails: std::collections::VecDeque::new(),
             scope_gain: 1.0,
             scope_at: Instant::now(),
+            blink_epoch: Instant::now(),
             envelope: Vec::new(),
             spectrum_at: Instant::now(),
             parent: None,
@@ -897,10 +909,51 @@ impl App {
     /// When the loop next needs waking, or `None` when nothing is
     /// outstanding -- so an idle TUI sleeps instead of ticking.
     pub fn next_deadline(&self) -> Option<Instant> {
-        [self.volume_deadline(), self.seek_deadline(), self.playing_deadline()]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.volume_deadline(),
+            self.seek_deadline(),
+            self.playing_deadline(),
+            self.blink_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Whether playback is stopped, counting a pause the user has just
+    /// asked for and Spotify has yet to confirm.
+    ///
+    /// Reading the intent rather than the last poll is what makes the mark
+    /// start pulsing on the keypress instead of a second later.
+    fn paused(&self) -> bool {
+        match self.pending_playing {
+            Some(playing) => !playing,
+            None => self.playback.as_ref().is_some_and(|state| !state.is_playing),
+        }
+    }
+
+    /// Whether the pause mark is in the half of its cycle where it shows.
+    pub fn blink_shown(&self) -> bool {
+        self.blink_phase(Instant::now()).is_multiple_of(2)
+    }
+
+    fn blink_phase(&self, now: Instant) -> u128 {
+        now.saturating_duration_since(self.blink_epoch).as_millis() / BLINK_PHASE.as_millis()
+    }
+
+    /// When the mark next changes, so a paused screen is redrawn for it.
+    ///
+    /// `None` unless something is paused: an idle or playing TUI has
+    /// nothing to pulse and should go on sleeping rather than waking
+    /// twice a second to draw the same frame.
+    fn blink_deadline(&self) -> Option<Instant> {
+        if !self.paused() {
+            return None;
+        }
+        let now = Instant::now();
+        let into_phase =
+            now.saturating_duration_since(self.blink_epoch).as_millis() % BLINK_PHASE.as_millis();
+        Some(now + BLINK_PHASE - Duration::from_millis(into_phase as u64))
     }
 
     fn seek_deadline(&self) -> Option<Instant> {
