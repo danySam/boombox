@@ -169,19 +169,21 @@ impl Client {
 fn classify(status: u16, body: &str, retry_after: Option<u64>) -> Error {
     let detail = ErrorDetail::parse(body);
     let message = detail.message.clone().unwrap_or_else(|| body.trim().to_string());
-    let reason = detail.reason.unwrap_or_default();
+    let reason = detail.reason.clone().unwrap_or_default();
     let lower = message.to_ascii_lowercase();
 
     match status {
         401 => Error::NotAuthenticated,
         403 if reason == "PREMIUM_REQUIRED" || lower.contains("premium") => Error::PremiumRequired,
         404 if reason == "NO_ACTIVE_DEVICE" || lower.contains("device") => Error::NoActiveDevice,
-        429 => Error::Api {
-            status,
-            message: match retry_after {
-                Some(s) => format!("rate limited, retry in {s}s"),
-                None => "rate limited".into(),
-            },
+        // Both halves kept: the caller waits out the one and acts on the
+        // other. Flattening them into a sentence is what left a daemon
+        // retrying every two minutes against an hour-long cooldown, and
+        // made quota exhaustion indistinguishable from throttling in the
+        // logs.
+        429 => Error::RateLimited {
+            retry_after_secs: retry_after,
+            reason: detail.reason.filter(|r| !r.is_empty()),
         },
         _ => Error::Api { status, message },
     }
@@ -265,6 +267,30 @@ mod tests {
     fn rate_limit_surfaces_retry_after() {
         let e = classify(429, "{}", Some(12));
         assert!(e.to_string().contains("retry in 12s"), "{e}");
+    }
+
+    /// The wait has to arrive as a number, not inside a sentence: the daemon
+    /// schedules against it, and the version that formatted it away retried
+    /// every two minutes through an hour-long cooldown.
+    #[test]
+    fn a_rate_limit_keeps_its_wait_as_a_number() {
+        let e = classify(429, "{}", Some(3559));
+        assert!(matches!(e, Error::RateLimited { retry_after_secs: Some(3559), .. }), "{e}");
+    }
+
+    /// Quota exhaustion and ordinary throttling share a status code and need
+    /// different answers -- fewer requests against patience -- so Spotify's
+    /// own reason has to survive being classified.
+    #[test]
+    fn quota_exhaustion_keeps_its_reason() {
+        let body =
+            r#"{"error":{"status":429,"message":"Too many requests","reason":"QUOTA_EXCEEDED"}}"#;
+        let e = classify(429, body, Some(3381));
+        assert!(
+            matches!(&e, Error::RateLimited { reason: Some(r), .. } if r == "QUOTA_EXCEEDED"),
+            "{e}"
+        );
+        assert!(e.to_string().contains("QUOTA_EXCEEDED"), "{e}");
     }
 
     #[test]

@@ -33,6 +33,17 @@ pub enum Error {
     #[error("this requires Spotify Premium")]
     PremiumRequired,
 
+    #[error("spotify api error 429: {}", rate_limit_message(*retry_after_secs, reason.as_deref()))]
+    /// Spotify refused and said when to come back.
+    ///
+    /// Kept apart from [`Error::Api`] and kept structured, because both
+    /// halves are acted on rather than printed. The caller has to wait out
+    /// `retry_after_secs` instead of inventing a backoff, and `reason`
+    /// tells ordinary throttling from `QUOTA_EXCEEDED` -- the same status
+    /// code for two different problems, one fixed by asking less often and
+    /// the other only by waiting.
+    RateLimited { retry_after_secs: Option<u64>, reason: Option<String> },
+
     #[error("spotify api error {status}: {message}")]
     Api { status: u16, message: String },
 
@@ -77,6 +88,18 @@ pub enum Error {
 
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+/// What a 429 actually was, in as much detail as Spotify gave.
+///
+/// Shared with the wire format so the sentence a user sees is written in one
+/// place, rather than once here and once on its way through the socket.
+pub fn rate_limit_message(retry_after_secs: Option<u64>, reason: Option<&str>) -> String {
+    let what = reason.unwrap_or("rate limited");
+    match retry_after_secs {
+        Some(secs) => format!("{what}, retry in {secs}s"),
+        None => what.to_string(),
+    }
 }
 
 impl Error {

@@ -15,8 +15,28 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, RwLock, watch};
 
-/// Ceiling for the exponential backoff applied after a rate limit.
+/// Ceiling for the exponential backoff applied after a failed poll.
 const MAX_BACKOFF: Duration = Duration::from_secs(120);
+
+/// How recently a client must have asked for something before the daemon
+/// counts itself as being watched.
+///
+/// The TUI polls several times a second and a status line every few, so
+/// anything inside half a minute means somebody is looking.
+const ATTENDED_WINDOW: Duration = Duration::from_secs(30);
+
+/// How much further silence halves the request rate again.
+const UNATTENDED_STEP: Duration = Duration::from_secs(60);
+
+/// The slowest the poller will go, however long nobody looks.
+///
+/// Not "never": polling is also how boombox learns what has been playing,
+/// including on other devices, and that is the only way it can offer
+/// Spotify's own playlists back to you later.
+const UNATTENDED_MAX: Duration = Duration::from_secs(300);
+
+/// How long to wait out a 429 that did not say how long.
+const UNSAID_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Resolution of the per-track waveform. Wider than any terminal, so the seek
 /// bar can be resampled down to whatever the pane happens to be.
@@ -67,6 +87,12 @@ pub struct Daemon {
     /// serving state the user's own command just invalidated.
     nudge: Arc<Notify>,
     stats: Arc<Stats>,
+    /// When Spotify will take requests again, and why it stopped.
+    ///
+    /// Shared between the poller and forwarded commands on purpose: the
+    /// limit belongs to the account, not to one endpoint, so a cooldown
+    /// earned by either of them binds both.
+    cooldown: Arc<RwLock<Option<Cooldown>>>,
     /// Set once the Connect device is up; absent in non-streaming builds.
     #[cfg(feature = "streaming")]
     /// Swapped rather than set once: a dropped Connect session is
@@ -344,6 +370,17 @@ struct Stats {
     requests: AtomicU64,
     api_calls: AtomicU64,
     polling_millis: AtomicU64,
+    /// Milliseconds since the daemon started, at the last client request.
+    /// Zero means none yet, which wants the same treatment: a daemon nobody
+    /// has spoken to since boot has no one to keep a cache warm for.
+    last_request_millis: AtomicU64,
+}
+
+/// A pause Spotify asked for, and why.
+#[derive(Debug, Clone)]
+struct Cooldown {
+    until: Instant,
+    reason: Option<String>,
 }
 
 /// Removes the socket file on the way out, including on a panic. A leftover
@@ -392,6 +429,7 @@ pub async fn run(config: &Config) -> Result<()> {
         cache: Arc::new(RwLock::new(Cache::default())),
         nudge: Arc::new(Notify::new()),
         stats: Arc::new(Stats::default()),
+        cooldown: Arc::new(RwLock::new(None)),
         #[cfg(feature = "streaming")]
         spectrum: Arc::new(RwLock::new(None)),
         streaming_state: Arc::new(RwLock::new(initial_streaming_state())),
@@ -642,6 +680,38 @@ fn idle_streaming_note(state: &StreamingState) -> String {
     }
 }
 
+/// How long to wait before polling Spotify again.
+///
+/// Two questions rather than one. Whether anything is playing sets the pace
+/// a watcher needs; whether anyone is watching decides if that pace is worth
+/// paying for. Only the first used to be asked, so a daemon alone on a
+/// laptop polled once a second for as long as music played and every fifteen
+/// seconds forever after -- roughly 3,600 requests an hour, then 240, spent
+/// on a cache nobody read. Against a Development Mode quota shared by every
+/// app on the account, that was enough to exhaust it.
+///
+/// Unattended, the interval doubles for every [`UNATTENDED_STEP`] of silence
+/// up to [`UNATTENDED_MAX`]. It backs off rather than stopping because the
+/// cache still has a job: whoever asks next wants an answer, and a read
+/// wakes the loop anyway.
+fn poll_interval(
+    playing: bool,
+    since_request: Duration,
+    active: Duration,
+    idle: Duration,
+) -> Duration {
+    let base = if playing { active } else { idle };
+    let Some(unattended) = since_request.checked_sub(ATTENDED_WINDOW) else {
+        return base;
+    };
+    // Capped before the shift: 2^16 of anything is already far past the
+    // ceiling, and shifting by 32 or more is undefined.
+    let steps = (unattended.as_secs() / UNATTENDED_STEP.as_secs().max(1)).min(16) as u32;
+    // `max(base)` for a configuration whose idle interval is already slower
+    // than the ceiling: backing off must never speed polling up.
+    base.saturating_mul(1u32 << steps).min(UNATTENDED_MAX).max(base)
+}
+
 /// What a daemon reports before it has tried anything.
 fn initial_streaming_state() -> StreamingState {
     #[cfg(feature = "streaming")]
@@ -872,14 +942,84 @@ async fn wait_for_signal() {
 }
 
 impl Daemon {
+    /// How long since any client asked this daemon for anything.
+    ///
+    /// A daemon that has never been asked reads as "since startup", which
+    /// is the answer that matters: one started automatically and then left
+    /// alone is the case worth backing off from.
+    fn since_last_request(&self) -> Duration {
+        let last = Duration::from_millis(self.stats.last_request_millis.load(Ordering::Relaxed));
+        self.started.elapsed().saturating_sub(last)
+    }
+
+    /// What remains of a cooldown Spotify asked for, if one stands.
+    async fn cooldown_left(&self) -> Option<(Duration, Option<String>)> {
+        let held = self.cooldown.read().await;
+        let cooldown = held.as_ref()?;
+        let left = cooldown.until.checked_duration_since(Instant::now())?;
+        (!left.is_zero()).then(|| (left, cooldown.reason.clone()))
+    }
+
+    /// Records a pause, keeping whichever of the two runs longer.
+    ///
+    /// Longest wins because a second 429 during a cooldown usually reports
+    /// the remainder of the same restriction, and accepting the shorter
+    /// figure would let it expire early and start the cycle again.
+    async fn begin_cooldown(&self, wait: Duration, reason: Option<String>) {
+        let until = Instant::now() + wait;
+        let mut held = self.cooldown.write().await;
+        if held.as_ref().is_some_and(|standing| standing.until >= until) {
+            return;
+        }
+        tracing::warn!(
+            seconds = wait.as_secs(),
+            reason = reason.as_deref().unwrap_or("rate limited"),
+            "Spotify asked us to wait; holding every request until it is over"
+        );
+        *held = Some(Cooldown { until, reason });
+    }
+
+    /// Whether the cache has fallen behind the pace a watcher expects.
+    async fn cache_is_stale(&self) -> bool {
+        match self.cache.read().await.fetched_at {
+            Some(at) => at.elapsed() >= self.active_interval,
+            None => true,
+        }
+    }
+
     async fn poll_loop(&self, mut shutdown: watch::Receiver<bool>) {
         let mut backoff: Option<Duration> = None;
 
         loop {
+            // Nothing is attempted while a cooldown stands, and a nudge
+            // cannot cut one short. Retrying early is exactly what turned an
+            // hour-long restriction into an hour of rejected requests.
+            if let Some((left, _)) = self.cooldown_left().await {
+                self.stats.polling_millis.store(left.as_millis() as u64, Ordering::Relaxed);
+                tokio::select! {
+                    () = tokio::time::sleep(left) => {}
+                    _ = shutdown.changed() => break,
+                }
+                continue;
+            }
+
             let interval = match self.refresh().await {
                 Ok(is_playing) => {
                     backoff = None;
-                    if is_playing { self.active_interval } else { self.idle_interval }
+                    poll_interval(
+                        is_playing,
+                        self.since_last_request(),
+                        self.active_interval,
+                        self.idle_interval,
+                    )
+                }
+                // Taken at its word rather than guessed at. Spotify says how
+                // long it wants; a backoff of our own invention just spends
+                // requests discovering that it meant it.
+                Err(Error::RateLimited { retry_after_secs, reason }) => {
+                    let wait = retry_after_secs.map(Duration::from_secs).unwrap_or(UNSAID_COOLDOWN);
+                    self.begin_cooldown(wait, reason).await;
+                    continue;
                 }
                 Err(e) => {
                     // Keep serving cached state; a transient API failure is not
@@ -1018,6 +1158,10 @@ impl Daemon {
             return Ok(());
         }
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
+        // What tells an attended daemon from one talking to itself.
+        self.stats
+            .last_request_millis
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
 
         let (response, stop) = match serde_json::from_str::<Request>(&line) {
             Ok(request) => self.dispatch(request).await,
@@ -1090,7 +1234,27 @@ impl Daemon {
         (response, false)
     }
 
+    /// Sends a request to Spotify, unless Spotify has asked us not to.
+    ///
+    /// Gated here as well as in the poller because the limit belongs to the
+    /// account rather than to one endpoint: while a cooldown stands, the
+    /// only thing another request can achieve is to be refused. Saying so
+    /// with the time left beats spending a request to be told.
     async fn forward(&self, request: Request) -> Result<Response, Error> {
+        if let Some((left, reason)) = self.cooldown_left().await {
+            return Err(Error::RateLimited { retry_after_secs: Some(left.as_secs()), reason });
+        }
+        let result = self.send_to_spotify(request).await;
+        // A command can be the first to meet a new restriction. Recording it
+        // here saves the poller from discovering the same thing separately.
+        if let Err(Error::RateLimited { retry_after_secs, reason }) = &result {
+            let wait = retry_after_secs.map(Duration::from_secs).unwrap_or(UNSAID_COOLDOWN);
+            self.begin_cooldown(wait, reason.clone()).await;
+        }
+        result
+    }
+
+    async fn send_to_spotify(&self, request: Request) -> Result<Response, Error> {
         self.stats.api_calls.fetch_add(1, Ordering::Relaxed);
         let client = &*self.client;
 
@@ -1177,6 +1341,11 @@ impl Daemon {
                 | Response::Contains(_)
         );
         if !is_read {
+            self.nudge.notify_one();
+        } else if self.cache_is_stale().await {
+            // Somebody is looking again after a quiet spell, and the poller
+            // may be minutes into a backed-off sleep. Wake it, so the read
+            // after this one is current rather than waiting that out.
             self.nudge.notify_one();
         }
         Ok(response)
@@ -2079,6 +2248,43 @@ mod tests {
         assert_eq!(resume_for(Some(&polled_state()), "some-other-device"), None);
     }
 
+    /// The quota bug: a daemon nobody was talking to polled exactly as hard
+    /// as one driving a progress bar somebody could see.
+    #[test]
+    fn an_unattended_daemon_backs_off_from_either_pace() {
+        let (active, idle) = (Duration::from_secs(1), Duration::from_secs(15));
+        assert_eq!(poll_interval(true, Duration::ZERO, active, idle), active);
+        assert_eq!(poll_interval(false, Duration::ZERO, active, idle), idle);
+
+        // Inside the window still counts as watched: a status line ticking
+        // every few seconds is not an empty room.
+        let recent = ATTENDED_WINDOW - Duration::from_secs(1);
+        assert_eq!(poll_interval(true, recent, active, idle), active);
+
+        let alone = ATTENDED_WINDOW + UNATTENDED_STEP * 3;
+        assert!(poll_interval(true, alone, active, idle) > active);
+    }
+
+    /// Doubling rather than a cliff, so the cache stays worth reading and
+    /// recents keep being collected -- just not at 3,600 requests an hour.
+    #[test]
+    fn the_unattended_interval_doubles_then_levels_off() {
+        let (active, idle) = (Duration::from_secs(1), Duration::from_secs(15));
+        let quiet_for = |steps: u32| ATTENDED_WINDOW + UNATTENDED_STEP * steps;
+        assert_eq!(poll_interval(true, quiet_for(0), active, idle), Duration::from_secs(1));
+        assert_eq!(poll_interval(true, quiet_for(1), active, idle), Duration::from_secs(2));
+        assert_eq!(poll_interval(true, quiet_for(2), active, idle), Duration::from_secs(4));
+        assert_eq!(poll_interval(true, quiet_for(40), active, idle), UNATTENDED_MAX);
+    }
+
+    /// The thing meant to slow polling down must never speed it up, however
+    /// unhurried the configured interval already is.
+    #[test]
+    fn backing_off_never_polls_faster_than_configured() {
+        let slow = UNATTENDED_MAX + Duration::from_secs(60);
+        assert_eq!(poll_interval(false, Duration::from_secs(86_400), slow, slow), slow);
+    }
+
     /// Nothing active, or nothing polled yet, leaves nothing to put back.
     #[cfg(feature = "streaming")]
     #[test]
@@ -2227,6 +2433,7 @@ mod tests {
             cache: Arc::new(RwLock::new(Cache::default())),
             nudge: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
+            cooldown: Arc::new(RwLock::new(None)),
             #[cfg(feature = "streaming")]
             spectrum: Arc::new(RwLock::new(None)),
             streaming_state: Arc::new(RwLock::new(initial_streaming_state())),

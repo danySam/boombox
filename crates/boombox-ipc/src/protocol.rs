@@ -349,6 +349,14 @@ impl From<&Error> for WireError {
             Error::NoActiveDevice => (WireErrorKind::NoActiveDevice, 0, err.to_string()),
             Error::PremiumRequired => (WireErrorKind::PremiumRequired, 0, err.to_string()),
             Error::Api { status, message } => (WireErrorKind::Api, *status, message.clone()),
+            // Named rather than left to the catch-all, which would send the
+            // Display form and have the client wrap a second "spotify api
+            // error 0:" around text that already carries the prefix.
+            Error::RateLimited { retry_after_secs, reason } => (
+                WireErrorKind::Api,
+                429,
+                boombox_core::error::rate_limit_message(*retry_after_secs, reason.as_deref()),
+            ),
             _ => (WireErrorKind::Other, 0, err.to_string()),
         };
         Self { kind, message, status }
@@ -373,6 +381,21 @@ mod tests {
 
     fn roundtrip(req: &Request) -> Request {
         serde_json::from_str(&serde_json::to_string(req).unwrap()).unwrap()
+    }
+
+    /// The reason is the point of carrying a rate limit at all, and the
+    /// prefix must not arrive twice: `Error::Api` adds one when shown, so a
+    /// Display form sent over the socket would come back wrapped in another.
+    #[test]
+    fn a_rate_limit_crosses_the_wire_intact() {
+        let err = Error::RateLimited {
+            retry_after_secs: Some(3381),
+            reason: Some("QUOTA_EXCEEDED".into()),
+        };
+        let shown = Error::from(WireError::from(&err)).to_string();
+        assert!(shown.contains("QUOTA_EXCEEDED"), "{shown}");
+        assert!(shown.contains("3381"), "{shown}");
+        assert_eq!(shown.matches("spotify api error").count(), 1, "{shown}");
     }
 
     #[test]
