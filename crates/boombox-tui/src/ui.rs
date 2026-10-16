@@ -454,6 +454,59 @@ fn visual(frame: &mut Frame, area: Rect, app: &App, mode: VisualMode) {
             frame.render_widget(Waterfall { history: &app.history, palette: app.palette }, area)
         }
         VisualMode::Scope => scope(frame, area, app),
+        VisualMode::Fire => {
+            frame.render_widget(Flames { fire: &app.fire, palette: app.palette }, area)
+        }
+    }
+}
+
+/// The fire, drawn in the album's colours like everything else on the
+/// stage. Half blocks again, so each cell carries two pixels of flame.
+struct Flames<'a> {
+    fire: &'a crate::app::Fire,
+    palette: Palette,
+}
+
+impl ratatui::widgets::Widget for Flames<'_> {
+    fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let pixels = area.height as usize * 2;
+        // Few enough that a scan beats anything cleverer, and usually
+        // empty.
+        let sparks: Vec<(usize, usize, f32)> = self.fire.sparks().collect();
+        let ember = |x: usize, up: usize| {
+            sparks.iter().find(|&&(sx, sup, _)| sx == x && sup == up).map(|&(_, _, heat)| heat)
+        };
+
+        for x in 0..area.width {
+            for row in 0..area.height as usize {
+                // Counted up from the bottom of the pane, which is where
+                // the fire is lit.
+                let upper = pixels - 1 - row * 2;
+                // An ember sits in front of the flame rather than adding
+                // to it, so where there is one it is what gets drawn.
+                let top = ember(x as usize, upper)
+                    .unwrap_or_else(|| self.fire.intensity(x as usize, upper));
+                let bottom = ember(x as usize, upper - 1)
+                    .unwrap_or_else(|| self.fire.intensity(x as usize, upper - 1));
+
+                // The coolest cells are left undrawn so the terminal's own
+                // background shows through. It keeps light themes working,
+                // as the waterfall does, and it is also what makes flames
+                // look like flames rather than an orange gradient.
+                let (ch, fg, bg) = match (top >= QUIET, bottom >= QUIET) {
+                    (false, false) => continue,
+                    (true, true) => ('\u{2580}', self.palette.at(top), self.palette.at(bottom)),
+                    (true, false) => ('\u{2580}', self.palette.at(top), Color::Reset),
+                    (false, true) => ('\u{2584}', self.palette.at(bottom), Color::Reset),
+                };
+                if let Some(cell) = buf.cell_mut((area.x + x, area.y + row as u16)) {
+                    cell.set_char(ch).set_style(Style::new().fg(fg).bg(bg));
+                }
+            }
+        }
     }
 }
 
@@ -2483,7 +2536,7 @@ mod tests {
         let mut app = playing_app();
         app.cycle_visual(); // bars
         app.cycle_visual(); // spectrogram
-        app.set_stage_width(400);
+        app.set_stage_size(400, 24);
         for _ in 0..400 {
             app.set_spectrum(vec![0.9; 64]);
         }
@@ -2494,7 +2547,7 @@ mod tests {
         let mut capped = playing_app();
         capped.cycle_visual();
         capped.cycle_visual();
-        capped.set_stage_width(256);
+        capped.set_stage_size(256, 24);
         for _ in 0..400 {
             capped.set_spectrum(vec![0.9; 64]);
         }

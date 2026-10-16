@@ -139,7 +139,7 @@ where
     // resizes a terminal that is already the right size, so waiting for a
     // resize event would mean waiting forever.
     if let Ok(size) = terminal.size() {
-        app.set_stage_width(size.width);
+        app.set_stage_size(size.width, size.height);
     }
     // Surfaced immediately rather than left for the first request that
     // happens to hit a changed message, which is a baffling way to find out.
@@ -312,9 +312,9 @@ where
                     // takes the image with it -- and the stage changes
                     // width, which is how much history the waterfall needs
                     // to reach its left edge.
-                    Event::Resize(width, _) => {
+                    Event::Resize(width, height) => {
                         graphics.invalidate();
-                        app.set_stage_width(width);
+                        app.set_stage_size(width, height);
                     }
                     _ => {}
                 }

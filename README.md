@@ -416,8 +416,8 @@ daemon. Premium only.
 
 ### Spectrum analyser
 
-Press `v` in the TUI to cycle **bars → spectrogram → oscilloscope**, and once
-more to go back to the cover.
+Press `v` in the TUI to cycle **bars → spectrogram → oscilloscope → fire**,
+and once more to go back to the cover.
 A real FFT over the audio librespot is decoding — not a decoration driven by
 the progress bar.
 
@@ -452,6 +452,25 @@ rising zero crossing, so successive frames line up, and the last few stay
 behind as a dimmer afterglow. Its automatic gain comes down quickly when the
 music gets loud and recovers slowly when it goes quiet, so gaps are not pumped
 up to full height.
+
+**Fire** burns the spectrum. It uses the cellular automaton from the PlayStation
+port of DOOM, which Fabien Sanglard
+[wrote up in detail](https://fabiensanglard.net/doom_fire_psx/): a row of heat
+along the bottom, and above it every pixel takes from the one below, cooling a
+step at random and drifting sideways as it goes. This implementation was written
+from that description rather than from id's code, which is GPL where boombox is
+MIT.
+
+What differs is the bottom row. DOOM held it at a constant white; here it is the
+spectrum, so the flame over each column is as tall as that band is loud — bass
+on the left roars, treble on the right flickers. A band that has just risen
+burns hotter than one merely held loud, so hits flare rather than only being
+large, and the share of energy up top widens how far the flames wander, so
+cymbals scatter them where a bassline lets them stand. Embers blow in now and
+then along the right and bottom edges and climb away to the left, with the
+flames rather than against them. Colours come from the cover art like everything
+else on the stage, and the coolest cells are left undrawn, which keeps light
+themes working.
 
 ### Waveform seek bar
 

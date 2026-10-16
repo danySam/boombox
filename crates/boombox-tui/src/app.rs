@@ -55,6 +55,278 @@ const GAIN_RISE_PER_SEC: f32 = 0.8;
 /// play next.
 pub(crate) const BLINK_PHASE: Duration = Duration::from_millis(600);
 
+/// Pixel rows kept for the fire, two to a terminal row.
+///
+/// Enough for a stage 64 rows tall, which is taller than the pane gets in
+/// practice. A grid taller than the pane costs a little arithmetic and
+/// nothing else: the flames simply burn off the top unseen.
+const FIRE_ROWS: usize = 128;
+
+/// How hot the bottom row can get, in palette steps.
+///
+/// Also roughly how far a flame travels, since each row up loses nought or
+/// one: enough to cross a tall pane when the music is loud, and to fall
+/// well short of it when it is not.
+const FIRE_MAX_HEAT: u8 = 48;
+
+/// How much a band that has just risen burns above its own level.
+///
+/// Without this a kick drum and a sustained loud note look the same, which
+/// is the difference between a fire that moves with the music and one that
+/// is merely large while the music is loud.
+const FIRE_ATTACK_GAIN: f32 = 1.6;
+
+/// How fast the remembered level falls, per frame.
+///
+/// Slow enough that a repeated hit still reads as a hit, quick enough that
+/// the fire settles within about a second of the music doing so.
+const FIRE_ATTACK_FALL: f32 = 0.08;
+
+/// Odds out of 256 that an ember breaks away in a given frame.
+///
+/// Rare enough to be a thing you notice rather than weather: about one
+/// every two seconds at thirty frames a second, which with a crossing
+/// that lasts under two leaves usually one in the air and sometimes none.
+const FIRE_SPARK_CHANCE: u8 = 4;
+
+/// How many embers may be in the air at once, so a long loud passage
+/// cannot fill the sky with them.
+const FIRE_SPARKS_MAX: usize = 16;
+
+/// An ember cools a step when a draw lands on this mask -- one row in
+/// eight, slow enough to carry it clear of the fire that threw it.
+const FIRE_SPARK_COOL: u8 = 7;
+
+/// How hot the foot of a column must be to throw one.
+const FIRE_SPARK_FLOOR: u8 = FIRE_MAX_HEAT / 3;
+
+/// An ember that has left the fire.
+///
+/// Tracked apart from the grid because the fire has no memory: a cell
+/// that skipped cooling once would be indistinguishable from the flame
+/// around it by the next frame, and could never climb clear. A spark
+/// carries its own height and heat, and is painted over the fire after
+/// the flames have been worked out.
+#[derive(Clone, Copy)]
+struct Spark {
+    x: usize,
+    up: usize,
+    heat: u8,
+}
+
+/// How far a flame may drift sideways in a row, before and after treble.
+///
+/// The low end is the original's: offsets of one column right to two left.
+/// Cymbals widen it, which is what makes the flames scatter when a track
+/// is busy up top and stand still when it is not.
+const FIRE_SWIRL_CALM: u8 = 4;
+const FIRE_SWIRL_BUSY: u8 = 8;
+
+/// How wide the flames may wander, from where the energy sits.
+///
+/// A share rather than a level, so it answers "is this track busy up top"
+/// rather than "is it loud" -- which the height already says.
+fn fire_swirl(bands: &[f32]) -> u8 {
+    if bands.len() < 3 {
+        return FIRE_SWIRL_CALM;
+    }
+    let total: f32 = bands.iter().sum();
+    if total <= f32::EPSILON {
+        return FIRE_SWIRL_CALM;
+    }
+    let top: f32 = bands[bands.len() * 2 / 3..].iter().sum();
+    // The top third of the bands holds about a third of the energy when a
+    // track is evenly spread, and that should read as middling rather than
+    // as cymbals: 1.5 puts an even spread halfway and saves the far end for
+    // music that really is bright.
+    let share = ((top / total) * 1.5).clamp(0.0, 1.0);
+    FIRE_SWIRL_CALM + ((FIRE_SWIRL_BUSY - FIRE_SWIRL_CALM) as f32 * share).round() as u8
+}
+
+/// A fire burning under the spectrum, hottest row at the bottom.
+///
+/// The technique is the cellular automaton from the PlayStation port of
+/// DOOM, which Fabien Sanglard wrote up at
+/// <https://fabiensanglard.net/doom_fire_psx/>: a row of heat at the
+/// bottom, and above it every pixel takes from the one below, cooled a
+/// step at random and drifting sideways a column or two.
+///
+/// Written from that description rather than from id's code, which is GPL
+/// where this is MIT. An algorithm carries no licence of its own, so this
+/// is a credit rather than an obligation -- but it is owed.
+///
+/// What differs is the bottom row. Doom held it at a constant white; here
+/// it is the spectrum, so the flame under each column is as tall as that
+/// band is loud. Bass on the left roars, treble on the right flickers, and
+/// a kick sends a burst up the screen that the cooling drags into a trail.
+#[derive(Default)]
+pub struct Fire {
+    cells: Vec<u8>,
+    width: usize,
+    /// The level each band is remembered at, falling slowly. A band above
+    /// its own memory has just been struck, and burns hotter for it.
+    remembered: Vec<f32>,
+    /// Embers in the air, oldest first.
+    sparks: Vec<Spark>,
+}
+
+impl Fire {
+    /// Heat `up` pixels above the bottom of the grid, 0 outside it.
+    pub fn heat(&self, x: usize, up: usize) -> u8 {
+        if self.width == 0 || x >= self.width || up >= FIRE_ROWS {
+            return 0;
+        }
+        self.cells[(FIRE_ROWS - 1 - up) * self.width + x]
+    }
+
+    /// Heat as a fraction of the hottest the bottom row can be, which is
+    /// what the palette wants.
+    pub fn intensity(&self, x: usize, up: usize) -> f32 {
+        f32::from(self.heat(x, up)) / f32::from(FIRE_MAX_HEAT)
+    }
+
+    /// One step: a new row of heat from the music, then everything above
+    /// takes from below.
+    ///
+    /// `draw` supplies the randomness, passed in rather than taken from a
+    /// global so a test can hand it a known sequence and get a known fire.
+    fn advance(&mut self, bands: &[f32], width: usize, rows: usize, mut draw: impl FnMut() -> u8) {
+        if width == 0 || bands.is_empty() {
+            self.cells.clear();
+            self.width = 0;
+            return;
+        }
+        if self.width != width {
+            self.width = width;
+            self.cells = vec![0; width * FIRE_ROWS];
+        }
+
+        if self.remembered.len() != bands.len() {
+            self.remembered = vec![0.0; bands.len()];
+        }
+
+        // The source row, each column lit by the band beneath it -- plus
+        // whatever that band has just gained, so a hit flares rather than
+        // merely being loud.
+        for x in 0..width {
+            let i = x * bands.len() / width;
+            let band = bands[i].clamp(0.0, 1.0);
+            let attack = (band - self.remembered[i]).max(0.0);
+            let heat = (band + attack * FIRE_ATTACK_GAIN).clamp(0.0, 1.0);
+            self.cells[(FIRE_ROWS - 1) * width + x] =
+                (heat * f32::from(FIRE_MAX_HEAT)).round() as u8;
+        }
+        for (remembered, band) in self.remembered.iter_mut().zip(bands) {
+            *remembered = band.clamp(0.0, 1.0).max(*remembered - FIRE_ATTACK_FALL);
+        }
+
+        // How far a flame may wander, from how busy the top of the
+        // spectrum is. Cymbals scatter it; a bassline lets it stand.
+        let swirl = usize::from(fire_swirl(bands));
+
+        // Ascending, so each row is read before the pass above overwrites
+        // it. Going the other way would carry the bottom row to the top in
+        // a single frame, and the fire would have no shape at all.
+        for y in 1..FIRE_ROWS {
+            for x in 0..width {
+                let heat = self.cells[y * width + x];
+                let spread = usize::from(draw()) % swirl;
+                // One column right at most, and further left the busier it
+                // is up top. The drift is what stops the flames standing in
+                // rigid columns, and cooling with it is what gives the
+                // leaning edges their softness.
+                let target = (x + 1).saturating_sub(spread).min(width - 1);
+                self.cells[(y - 1) * width + target] = heat.saturating_sub((spread & 1) as u8);
+            }
+        }
+
+        self.carry_sparks(&mut draw);
+        self.light_a_spark(width, rows, &mut draw);
+    }
+
+    /// The embers in the air, as column, height and brightness.
+    ///
+    /// Kept out of the heat grid and handed to the renderer instead. Put
+    /// into the grid they would be picked up by the next frame's
+    /// propagation and carried along as fuel, so each ember would trail a
+    /// bright plume of flame behind it instead of being a thing of its
+    /// own.
+    ///
+    /// Embers off the right of the pane are included and simply never
+    /// match a column, which is how one drifts into view already climbing
+    /// rather than appearing out of nothing at the edge.
+    pub fn sparks(&self) -> impl Iterator<Item = (usize, usize, f32)> + '_ {
+        self.sparks
+            .iter()
+            .map(|spark| (spark.x, spark.up, f32::from(spark.heat) / f32::from(FIRE_MAX_HEAT)))
+    }
+
+    /// Carries every ember up a row, and lets the cold ones go out.
+    fn carry_sparks(&mut self, draw: &mut impl FnMut() -> u8) {
+        for spark in &mut self.sparks {
+            spark.up += 1;
+            // A column or two left for every row up, which is the way the
+            // flames themselves lean: their drift averages half a column
+            // left at rest and more when treble widens it, so an ember
+            // crossing the other way reads as going the wrong way up a
+            // hill. Steep, because the pane is a few dozen pixels tall and
+            // a good deal wider.
+            spark.x = spark.x.saturating_sub(1 + usize::from(draw() & 1));
+            if draw() & FIRE_SPARK_COOL == 0 {
+                spark.heat = spark.heat.saturating_sub(1);
+            }
+        }
+        self.sparks.retain(|s| s.up + 1 < FIRE_ROWS && s.heat > 0 && s.x > 0);
+    }
+
+    /// Now and then, lights one somewhere along an edge it can blow in
+    /// from.
+    ///
+    /// Embers travel up and to the left, so they can only enter across the
+    /// right edge or the bottom one. Lighting them all in the corner where
+    /// those meet gives the whole field one origin; spreading them along
+    /// both edges gives the same angle arriving from everywhere, which is
+    /// what a drift of embers actually looks like.
+    ///
+    /// Which edge is chosen in proportion to how much of the flow crosses
+    /// it -- the sideways travel against the height of the pane, the climb
+    /// against its width -- so neither edge is busier than the motion says
+    /// it should be.
+    fn light_a_spark(&mut self, width: usize, rows: usize, draw: &mut impl FnMut() -> u8) {
+        if self.sparks.len() >= FIRE_SPARKS_MAX || draw() >= FIRE_SPARK_CHANCE {
+            return;
+        }
+        // Something has to be burning somewhere, which is why silence
+        // throws none.
+        if !(0..width).any(|x| self.heat(x, 0) >= FIRE_SPARK_FLOOR) {
+            return;
+        }
+        let rows = rows.clamp(1, FIRE_ROWS);
+        // Three and two being the sideways and upward travel per row,
+        // doubled to keep them whole.
+        let through_side = 3 * rows;
+        let through_bottom = 2 * width;
+        let edge = usize::from(draw()) * (through_side + through_bottom) / 256;
+
+        let spark = if edge < through_side {
+            // In from the right, at any height the pane reaches. A column
+            // or two beyond the edge, so it arrives rather than appears:
+            // the renderer draws nothing past the boundary.
+            Spark {
+                x: width + 1 + usize::from(draw() & 3),
+                up: usize::from(draw()) * rows / 256,
+                heat: FIRE_MAX_HEAT,
+            }
+        } else {
+            // Up off the bottom, anywhere across it. One lit near the left
+            // leaves again almost at once, which is what the angle says
+            // should happen to it.
+            Spark { x: usize::from(draw()) * width / 256, up: 0, heat: FIRE_MAX_HEAT }
+        };
+        self.sparks.push(spark);
+    }
+}
+
 /// Least spectrum history kept for the waterfall, in frames.
 ///
 /// The waterfall paints one column per frame it has, right-aligned, so the
@@ -62,7 +334,7 @@ pub(crate) const BLINK_PHASE: Duration = Duration::from_millis(600);
 /// A fixed 256 used to be the whole story, on the grounds that it was
 /// "wider than any sensible terminal" -- which a large display disproved by
 /// leaving the left third of the spectrogram empty. The cap now follows the
-/// terminal (see [`App::set_stage_width`]) and this is only the floor, for
+/// terminal (see [`App::set_stage_size`]) and this is only the floor, for
 /// before a width is known.
 ///
 /// At one frame per 33ms a wider pane is also a longer memory: 256 frames is
@@ -187,6 +459,7 @@ pub enum VisualMode {
     Bars,
     Spectrogram,
     Scope,
+    Fire,
 }
 
 impl VisualMode {
@@ -195,6 +468,7 @@ impl VisualMode {
             Self::Bars => "Bars",
             Self::Spectrogram => "Spectrogram",
             Self::Scope => "Oscilloscope",
+            Self::Fire => "Fire",
         }
     }
 
@@ -202,7 +476,8 @@ impl VisualMode {
         match self {
             Self::Bars => Self::Spectrogram,
             Self::Spectrogram => Self::Scope,
-            Self::Scope => Self::Bars,
+            Self::Scope => Self::Fire,
+            Self::Fire => Self::Bars,
         }
     }
 }
@@ -410,6 +685,14 @@ pub struct App {
     /// How many of those to keep: as many as the stage is wide, so the
     /// waterfall can reach the left edge whatever the terminal is doing.
     history_cap: usize,
+    /// How wide the stage is, for the visualisations that keep a grid of
+    /// their own rather than being drawn fresh each frame.
+    stage_width: usize,
+    /// And how tall, in pixels. The fire needs it to know which part of
+    /// its grid anybody can actually see.
+    stage_rows: usize,
+    /// The fire, when it is the one on screen.
+    pub fire: Fire,
     pub visual: Option<VisualMode>,
     /// Derived from the current track, so every visualisation agrees and the
     /// display changes when the music does.
@@ -525,6 +808,9 @@ impl App {
             smoothed: Vec::new(),
             history: std::collections::VecDeque::new(),
             history_cap: MIN_HISTORY,
+            stage_width: 0,
+            stage_rows: 0,
+            fire: Fire::default(),
             visual: None,
             palette: Palette::default(),
             cover: None,
@@ -681,8 +967,14 @@ impl App {
     /// Only ever grows the memory a wide terminal actually needs; the
     /// surplus is dropped a frame later by [`Self::set_spectrum`], which is
     /// the one place history is pruned.
-    pub fn set_stage_width(&mut self, width: u16) {
+    pub fn set_stage_size(&mut self, width: u16, height: u16) {
         self.history_cap = (width as usize).max(MIN_HISTORY);
+        self.stage_width = width as usize;
+        // Two pixels a row, and the whole terminal rather than the stage
+        // alone -- the legend and the player bar are a few rows of it. The
+        // only cost of guessing a little high is an ember spawning just
+        // above the pane and never being seen.
+        self.stage_rows = (height as usize * 2).min(FIRE_ROWS);
     }
 
     pub fn set_spectrum(&mut self, bands: Vec<f32>) {
@@ -722,6 +1014,14 @@ impl App {
             while self.history.len() > self.history_cap {
                 self.history.pop_front();
             }
+        }
+
+        // Only while it is the one on screen. The grid is cheap but not
+        // free, and the other visualisations have no use for it.
+        if self.visual == Some(VisualMode::Fire) {
+            let (width, rows) = (self.stage_width, self.stage_rows);
+            let mut rng = rand::rng();
+            self.fire.advance(&bands, width, rows, || rand::Rng::random::<u8>(&mut rng));
         }
         self.spectrum = bands;
     }
@@ -813,7 +1113,7 @@ impl App {
     pub fn cycle_visual(&mut self) {
         self.visual = match self.visual {
             None => Some(VisualMode::Bars),
-            Some(VisualMode::Scope) => None,
+            Some(VisualMode::Fire) => None,
             Some(mode) => Some(mode.next()),
         };
     }
@@ -822,7 +1122,7 @@ impl App {
     /// not by which list happens to be open: the visualisation keeps running
     /// underneath the palette.
     pub fn wants_spectrum(&self) -> bool {
-        matches!(self.visual, Some(VisualMode::Bars | VisualMode::Spectrogram))
+        matches!(self.visual, Some(VisualMode::Bars | VisualMode::Spectrogram | VisualMode::Fire))
     }
 
     /// Records that the user is still here. Anything that redraws on its own
@@ -2977,11 +3277,201 @@ pub(crate) mod tests {
     #[test]
     fn a_wide_stage_keeps_enough_history_to_reach_its_left_edge() {
         let mut app = App::new(5, false);
-        app.set_stage_width(400);
+        app.set_stage_size(400, 24);
         for i in 0..500 {
             app.set_spectrum(vec![i as f32 / 1000.0]);
         }
         assert_eq!(app.history.len(), 400, "one frame per column, the full width");
+    }
+
+    /// A draw that makes the fire behave predictably: `% swirl` is 1 at
+    /// any swirl, which sends every flame straight up and cools it a step
+    /// a row, and it is above the spark threshold, so no embers wander
+    /// into the measurements.
+    const STEADY_DRAW: u8 = 9;
+
+    /// The whole reason for lighting the bottom row from the spectrum
+    /// rather than holding it at white: a loud band burns higher.
+    ///
+    /// Every draw returns 1, which sends the flame straight up and cools
+    /// it one step a row, so what this measures is the arithmetic rather
+    /// than the dice.
+    #[test]
+    fn a_louder_band_burns_higher() {
+        let reach = |level: f32| {
+            let mut fire = Fire::default();
+            for _ in 0..FIRE_ROWS {
+                fire.advance(&[level], 4, 40, || STEADY_DRAW);
+            }
+            (0..FIRE_ROWS).filter(|&up| fire.heat(0, up) > 0).count()
+        };
+        let (loud, quiet) = (reach(1.0), reach(0.25));
+        assert!(quiet > 0, "a quiet band should still show something");
+        assert!(loud > quiet, "loud reached {loud} rows, quiet {quiet}");
+    }
+
+    /// A struck band burns hotter than the same band merely held loud,
+    /// which is what makes a kick read as a kick rather than as volume.
+    #[test]
+    fn a_band_that_jumps_burns_hotter_than_one_held_steady() {
+        let bottom_after = |levels: &[f32]| {
+            let mut fire = Fire::default();
+            for &level in levels {
+                fire.advance(&[level], 4, 40, || STEADY_DRAW);
+            }
+            fire.heat(0, 0)
+        };
+        let held = bottom_after(&[0.6; 30]);
+
+        let mut struck: Vec<f32> = vec![0.1; 30];
+        struck.push(0.6);
+        let struck = bottom_after(&struck);
+
+        assert!(struck > held, "a hit at {struck} should beat a steady {held}");
+    }
+
+    /// Where the energy sits decides how far the flames wander: cymbals
+    /// scatter them, a bassline lets them stand.
+    #[test]
+    fn the_top_of_the_spectrum_decides_how_far_flames_wander() {
+        let only = |range: std::ops::Range<usize>| -> Vec<f32> {
+            (0..64).map(|i| if range.contains(&i) { 1.0 } else { 0.0 }).collect()
+        };
+        assert_eq!(fire_swirl(&only(0..20)), FIRE_SWIRL_CALM, "a bassline stands still");
+        assert_eq!(fire_swirl(&only(44..64)), FIRE_SWIRL_BUSY, "cymbals scatter it");
+
+        let even = fire_swirl(&[0.5; 64]);
+        assert!(
+            even > FIRE_SWIRL_CALM && even < FIRE_SWIRL_BUSY,
+            "an even spread belongs between the two, got {even}"
+        );
+    }
+
+    /// Silence is not treble. Dividing by a total of nothing would make an
+    /// empty spectrum the busiest thing on screen.
+    #[test]
+    fn silence_does_not_read_as_cymbals() {
+        assert_eq!(fire_swirl(&[0.0; 64]), FIRE_SWIRL_CALM);
+        assert_eq!(fire_swirl(&[]), FIRE_SWIRL_CALM);
+    }
+
+    /// And silence puts it out, rather than leaving embers on the screen.
+    #[test]
+    fn silence_burns_the_fire_out() {
+        let mut fire = Fire::default();
+        for _ in 0..FIRE_ROWS {
+            fire.advance(&[1.0], 4, 40, || STEADY_DRAW);
+        }
+        assert!(fire.heat(0, 10) > 0, "lit to begin with");
+
+        for _ in 0..FIRE_ROWS {
+            fire.advance(&[0.0], 4, 40, || STEADY_DRAW);
+        }
+        let left: u32 = (0..FIRE_ROWS).map(|up| u32::from(fire.heat(0, up))).sum();
+        assert_eq!(left, 0, "nothing should still be burning");
+    }
+
+    /// A draw of 3 asks for an ember every frame, carries it a column to
+    /// the right each row, and never cools it -- so the embers are the
+    /// only thing these three are measuring.
+    const EMBER_DRAW: u8 = 3;
+
+    /// Embers come off the fire, not out of nothing. A column with nothing
+    /// burning in it throws none, however often the dice ask.
+    #[test]
+    fn silence_throws_no_embers() {
+        let mut fire = Fire::default();
+        for _ in 0..40 {
+            fire.advance(&[0.0], 40, 40, || EMBER_DRAW);
+        }
+        assert!(fire.sparks.is_empty(), "silence should throw nothing");
+    }
+
+    /// A lit one does, and they climb clear of it and lean right as they
+    /// go -- which is why they are tracked apart from the flames.
+    #[test]
+    fn an_ember_drifts_in_from_the_right_and_climbs_to_the_left() {
+        let width = 60;
+        let mut fire = Fire::default();
+        fire.advance(&[1.0], width, 40, || EMBER_DRAW);
+        let born = *fire.sparks.first().expect("one should have been lit");
+        assert!(born.x >= width, "lit beyond the right edge, got {}", born.x);
+
+        for _ in 0..12 {
+            fire.advance(&[1.0], width, 40, || EMBER_DRAW);
+        }
+        let now = *fire.sparks.first().expect("still in the air");
+        assert!(now.x < born.x, "it should travel left: {} then {}", born.x, now.x);
+        assert!(now.x < width, "and into view, got {}", now.x);
+        assert!(now.up > born.up, "while climbing: {} then {}", born.up, now.up);
+    }
+
+    /// Embers blow in from along both edges they can enter by, rather
+    /// than all from the corner where those meet: one origin for the whole
+    /// field reads as a jet, spread along the edges it reads as drift.
+    #[test]
+    fn embers_arrive_from_along_both_edges() {
+        let (width, rows) = (60usize, 40usize);
+        let mut seed: u32 = 0x5EED_1234;
+        let mut draw = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 24) as u8
+        };
+
+        let mut fire = Fire::default();
+        fire.advance(&[1.0; 8], width, rows, &mut draw);
+
+        let (mut side, mut bottom) = (0, 0);
+        for _ in 0..2_000 {
+            // Cleared each time so the cap never stops a birth, and the
+            // one lit is the only one there.
+            fire.sparks.clear();
+            fire.light_a_spark(width, rows, &mut draw);
+            match fire.sparks.first() {
+                Some(spark) if spark.x >= width && spark.up > 0 => side += 1,
+                Some(spark) if spark.up == 0 && spark.x < width => bottom += 1,
+                _ => {}
+            }
+        }
+
+        assert!(side > 0, "some should come in across the right edge above the floor");
+        assert!(bottom > 0, "and some up off the bottom, inboard of the corner");
+        // Neither edge should be a rounding error against the other: the
+        // flow crosses both, so both should be carrying embers.
+        let total = side + bottom;
+        assert!(side * 5 > total, "too few from the side: {side} of {total}");
+        assert!(bottom * 5 > total, "too few from the bottom: {bottom} of {total}");
+    }
+
+    /// Capped, so a long loud passage cannot fill the sky with them.
+    #[test]
+    fn embers_are_capped() {
+        let mut fire = Fire::default();
+        for _ in 0..200 {
+            fire.advance(&[1.0], 60, 40, || EMBER_DRAW);
+        }
+        assert!(fire.sparks.len() <= FIRE_SPARKS_MAX, "{} in the air", fire.sparks.len());
+    }
+
+    /// A resized terminal rebuilds the grid, rather than indexing a new
+    /// width into an old one.
+    #[test]
+    fn the_fire_survives_a_resize() {
+        let mut fire = Fire::default();
+        for _ in 0..8 {
+            fire.advance(&[1.0], 10, 40, || STEADY_DRAW);
+        }
+        for _ in 0..8 {
+            fire.advance(&[1.0], 200, 40, || STEADY_DRAW);
+        }
+        assert!(fire.heat(199, 0) > 0, "the wider stage is lit all the way across");
+
+        for _ in 0..8 {
+            fire.advance(&[1.0], 3, 40, || STEADY_DRAW);
+        }
+        assert_eq!(fire.heat(199, 0), 0, "and nothing is read past a narrower one");
     }
 
     /// A narrow terminal does not shrink the history below the floor: the
@@ -2989,7 +3479,7 @@ pub(crate) mod tests {
     #[test]
     fn a_narrow_stage_still_keeps_the_floor() {
         let mut app = App::new(5, false);
-        app.set_stage_width(80);
+        app.set_stage_size(80, 24);
         for i in 0..(MIN_HISTORY + 40) {
             app.set_spectrum(vec![i as f32 / 1000.0]);
         }
@@ -3001,13 +3491,13 @@ pub(crate) mod tests {
     #[test]
     fn widening_the_terminal_lets_the_history_grow_into_it() {
         let mut app = App::new(5, false);
-        app.set_stage_width(80);
+        app.set_stage_size(80, 24);
         for i in 0..400 {
             app.set_spectrum(vec![i as f32 / 1000.0]);
         }
         assert_eq!(app.history.len(), MIN_HISTORY, "capped while narrow");
 
-        app.set_stage_width(500);
+        app.set_stage_size(500, 24);
         for i in 0..500 {
             app.set_spectrum(vec![i as f32 / 1000.0]);
         }
@@ -3027,7 +3517,9 @@ pub(crate) mod tests {
     fn v_cycles_off_through_every_visualisation_and_back_to_off() {
         let mut app = App::new(5, false);
         assert_eq!(app.visual, None, "the stage starts on the track itself");
-        for expected in [VisualMode::Bars, VisualMode::Spectrogram, VisualMode::Scope] {
+        for expected in
+            [VisualMode::Bars, VisualMode::Spectrogram, VisualMode::Scope, VisualMode::Fire]
+        {
             app.update(Action::CycleVisual);
             assert_eq!(app.visual, Some(expected));
         }
@@ -3048,6 +3540,9 @@ pub(crate) mod tests {
         app.cycle_visual(); // scope
         assert!(app.wants_waveform(), "the scope needs samples");
         assert!(!app.wants_spectrum(), "and not the bands");
+        app.cycle_visual(); // fire
+        assert!(app.wants_spectrum(), "the fire burns on the bands");
+        assert!(!app.wants_waveform(), "and has no use for raw samples");
 
         app.cycle_visual(); // off
         assert!(!app.wants_waveform());
