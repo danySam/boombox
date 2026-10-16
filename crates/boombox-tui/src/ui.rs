@@ -11,6 +11,25 @@ use crate::palette::Palette;
 const ACCENT: Color = Color::Green;
 const DIM: Color = Color::DarkGray;
 
+/// How the row under the cursor is drawn.
+///
+/// The foreground is set as well as the background, and that is the point.
+/// ratatui patches this over the spans already in the row rather than
+/// replacing them, so a background on its own leaves every span's own
+/// colour alone -- and bylines are drawn in [`DIM`], which is this exact
+/// grey. Artists on the selected row came out grey on grey: invisible, in
+/// every list, because they all highlight the same way.
+///
+/// It costs the title/byline distinction on one row, which the cursor and
+/// the bold already make plain enough.
+fn selected_row(focused: bool) -> Style {
+    if focused {
+        Style::new().bg(DIM).fg(Color::White).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+    }
+}
+
 /// Separator plus title, byline and progress.
 const BAR_HEIGHT: u16 = 4;
 
@@ -746,11 +765,7 @@ fn queue(frame: &mut Frame, area: Rect, app: &App) {
     let mut list_state = ListState::default();
     list_state.select(Some(app.queue_index));
     frame.render_stateful_widget(
-        List::new(items).block(block).highlight_style(if focused {
-            Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
-        } else {
-            Style::new()
-        }),
+        List::new(items).block(block).highlight_style(selected_row(focused)),
         area,
         &mut list_state,
     );
@@ -802,11 +817,7 @@ fn devices(frame: &mut Frame, area: Rect, app: &App) {
     let mut list_state = ListState::default();
     list_state.select(Some(app.device_index));
     frame.render_stateful_widget(
-        List::new(items).block(block).highlight_style(if focused {
-            Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
-        } else {
-            Style::new()
-        }),
+        List::new(items).block(block).highlight_style(selected_row(focused)),
         area,
         &mut list_state,
     );
@@ -1050,11 +1061,7 @@ fn entry_list(frame: &mut Frame, area: Rect, app: &App, title: &str) {
     let mut list_state = ListState::default();
     list_state.select(Some(selected));
     frame.render_stateful_widget(
-        List::new(items).block(block).highlight_style(if focused {
-            Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
-        } else {
-            Style::new()
-        }),
+        List::new(items).block(block).highlight_style(selected_row(focused)),
         area,
         &mut list_state,
     );
@@ -1566,6 +1573,46 @@ mod tests {
             duration_ms: None,
             kind: boombox_core::api::EntryKind::Artist,
         }
+    }
+
+    /// Reported from a real terminal: the artist on the selected row was
+    /// invisible, in every list. Bylines are drawn in DIM, the highlight
+    /// used DIM as its background, and ratatui patches the two together
+    /// rather than replacing, so grey text ended up sitting on grey.
+    #[test]
+    fn the_selected_row_never_draws_text_in_its_own_background() {
+        let song = |title: &str| Entry {
+            title: title.into(),
+            subtitle: "Example Artist".into(),
+            uri: Some("spotify:track:x".into()),
+            duration_ms: Some(1000),
+            kind: boombox_core::api::EntryKind::Track,
+        };
+        let mut app = playing_app();
+        app.view = crate::app::View::Liked;
+        app.set_entries(vec![song("Move"), song("Still")], 2, false);
+        app.browse_open = true;
+        app.entry_index = 0;
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
+        let cells: Vec<_> = terminal.backend().buffer().content().to_vec();
+
+        // Without this the test could pass by drawing no highlight at all.
+        let highlighted = cells.iter().filter(|c| c.bg == DIM).count();
+        assert!(highlighted > 0, "the row under the cursor should be highlighted");
+
+        let hidden: Vec<_> = cells
+            .iter()
+            .filter(|c| c.bg == DIM && c.fg == DIM && !c.symbol().trim().is_empty())
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(hidden.is_empty(), "text the same colour as what it sits on: {hidden:?}");
     }
 
     fn list_text(entries: Vec<Entry>, w: u16, h: u16) -> String {
