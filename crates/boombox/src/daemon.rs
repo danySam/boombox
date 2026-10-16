@@ -38,6 +38,17 @@ const UNATTENDED_MAX: Duration = Duration::from_secs(300);
 /// How long to wait out a 429 that did not say how long.
 const UNSAID_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// The longest a reconnect will sit out a cooldown before giving up on
+/// putting playback back.
+const RESUME_WAIT_MAX: Duration = Duration::from_secs(300);
+
+/// How long after a cooldown the poller stays slow.
+///
+/// Whatever allowance comes back is small and shared, and resuming at a
+/// poll a second would spend it again within the hour. The first requests
+/// after a restriction are better left for whatever the user does next.
+const EASE_AFTER_COOLDOWN: Duration = Duration::from_secs(300);
+
 /// Resolution of the per-track waveform. Wider than any terminal, so the seek
 /// bar can be resampled down to whatever the pane happens to be.
 #[cfg(feature = "streaming")]
@@ -989,6 +1000,9 @@ impl Daemon {
 
     async fn poll_loop(&self, mut shutdown: watch::Receiver<bool>) {
         let mut backoff: Option<Duration> = None;
+        // Set when a cooldown ends, so the poller walks out of one rather
+        // than sprinting: see EASE_AFTER_COOLDOWN.
+        let mut ease_until: Option<Instant> = None;
 
         loop {
             // Nothing is attempted while a cooldown stands, and a nudge
@@ -1000,6 +1014,7 @@ impl Daemon {
                     () = tokio::time::sleep(left) => {}
                     _ = shutdown.changed() => break,
                 }
+                ease_until = Some(Instant::now() + EASE_AFTER_COOLDOWN);
                 continue;
             }
 
@@ -1030,6 +1045,19 @@ impl Daemon {
                     backoff = Some(next);
                     next
                 }
+            };
+            // Leaving a cooldown gently. Whatever allowance comes back is
+            // shared and small, and going straight back to a poll a second
+            // is the quickest way into the next restriction -- so for a
+            // while the poller is held to its idle pace however much is
+            // playing, leaving the first requests for the user.
+            let interval = match ease_until {
+                Some(until) if Instant::now() < until => interval.max(self.idle_interval),
+                Some(_) => {
+                    ease_until = None;
+                    interval
+                }
+                None => interval,
             };
             self.stats.polling_millis.store(interval.as_millis() as u64, Ordering::Relaxed);
 
@@ -1430,6 +1458,29 @@ impl Daemon {
         // The id we are replacing is passed through so the stale state
         // Spotify serves for a few seconds after a session dies is not
         // mistaken for somebody else having taken playback.
+        // Every step below is a Web API call, so during a cooldown they can
+        // only be refused -- which is exactly how a reconnect lost playback
+        // on 14 October. Short restrictions are worth sitting out: the music
+        // was playing a moment ago and the gap goes unnoticed. Long ones are
+        // not, because starting the music again an hour after somebody
+        // walked away is worse than leaving it stopped.
+        if let Some((left, reason)) = self.cooldown_left().await {
+            if left > RESUME_WAIT_MAX {
+                tracing::warn!(
+                    was = %was.id, now = %device_id, seconds = left.as_secs(),
+                    reason = reason.as_deref().unwrap_or("rate limited"),
+                    "not restoring playback on {device_name}: Spotify is not taking requests, \
+                     and the wait is too long to assume it is still wanted"
+                );
+                return;
+            }
+            tracing::warn!(
+                seconds = left.as_secs(),
+                "waiting out a cooldown before restoring playback on {device_name}"
+            );
+            tokio::time::sleep(left).await;
+        }
+
         let took = self.take_when_idle(device_id, was.playing, Some(&was.id)).await;
         // At warn, to sit beside the line that announced the drop: a log
         // that says the connection went and never says what became of it
@@ -1486,7 +1537,17 @@ impl Daemon {
                         return Took::Busy;
                     }
                 }
-                Err(e) => return Took::Failed(format!("cannot tell what is playing: {e}")),
+                Err(e) => {
+                    // Recovery can be the first to meet a restriction, and
+                    // the poller should not have to spend another request
+                    // finding out the same thing.
+                    if let Error::RateLimited { retry_after_secs, reason } = &e {
+                        let wait =
+                            retry_after_secs.map(Duration::from_secs).unwrap_or(UNSAID_COOLDOWN);
+                        self.begin_cooldown(wait, reason.clone()).await;
+                    }
+                    return Took::Failed(format!("cannot tell what is playing: {e}"));
+                }
             }
 
             if let Ok(devices) = self.client.devices().await
@@ -2283,6 +2344,29 @@ mod tests {
     fn backing_off_never_polls_faster_than_configured() {
         let slow = UNATTENDED_MAX + Duration::from_secs(60);
         assert_eq!(poll_interval(false, Duration::from_secs(86_400), slow, slow), slow);
+    }
+
+    /// A second 429 during a cooldown reports what is left of the same
+    /// restriction, so taking the shorter figure would let the wait expire
+    /// early and walk straight back into it.
+    #[tokio::test]
+    async fn a_cooldown_keeps_whichever_wait_is_longer() {
+        let daemon = offline_daemon();
+        daemon.begin_cooldown(Duration::from_secs(600), Some("QUOTA_EXCEEDED".into())).await;
+        daemon.begin_cooldown(Duration::from_secs(5), None).await;
+
+        let (left, reason) = daemon.cooldown_left().await.expect("a cooldown stands");
+        assert!(left > Duration::from_secs(500), "the longer wait survives, got {left:?}");
+        assert_eq!(reason.as_deref(), Some("QUOTA_EXCEEDED"), "and so does the reason for it");
+    }
+
+    /// And nothing is held back once the wait has passed.
+    #[tokio::test]
+    async fn an_expired_cooldown_holds_nothing_back() {
+        let daemon = offline_daemon();
+        assert!(daemon.cooldown_left().await.is_none(), "none to begin with");
+        daemon.begin_cooldown(Duration::ZERO, None).await;
+        assert!(daemon.cooldown_left().await.is_none(), "nor once it is over");
     }
 
     /// Nothing active, or nothing polled yet, leaves nothing to put back.
