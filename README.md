@@ -1,3 +1,7 @@
+![boombox: a Spotify client for the terminal. The fire visualiser burning
+across the width of a terminal, with the track name and progress bar along the
+bottom](media/social-preview.png)
+
 # boombox
 
 A Spotify client for the terminal: a TUI and a scriptable CLI over the same core.
