@@ -8,6 +8,9 @@ $ boombox now --json | jq -r .track.name
 $ boombox            # opens the TUI
 ```
 
+![Pressing v to cycle the visualisers: bars, then the spectrogram, back to the
+cover art, then the fire burning the spectrum](media/visualisers.gif)
+
 ![boombox playing a track: cover art, title, artist and album above the player
 bar](media/main_view.png)
 
@@ -460,8 +463,7 @@ and once more to go back to the cover.
 A real FFT over the audio librespot is decoding — not a decoration driven by
 the progress bar.
 
-![Pressing v to cycle from bars to the spectrogram and back to the cover art,
-then the fire burning the spectrum](media/visualisers.gif)
+The animation at the top of this page is all four, in that order.
 
 | bars | spectrogram | oscilloscope | fire |
 |---|---|---|---|
