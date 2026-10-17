@@ -67,7 +67,21 @@ target="${arch}-${os}"
 # newer, so an older system has to be turned away here rather than at the
 # first run, where it fails with a loader error that explains nothing.
 if [ "$os" = "unknown-linux-gnu" ] && command -v ldd >/dev/null; then
-    have=$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+' | tail -1 || true)
+    libc=$(ldd --version 2>&1 || true)
+
+    # musl is not an older glibc, it is a different libc: the released
+    # binaries name a loader this system does not have, and no package
+    # it can install will change that.
+    case "$libc" in
+        *musl*)
+            die "this system uses musl, and the released binaries are built \
+against glibc.
+       Install with cargo instead:
+         cargo install boombox --locked --features streaming"
+            ;;
+    esac
+
+    have=$(printf '%s\n' "$libc" | head -1 | grep -oE '[0-9]+\.[0-9]+' | tail -1 || true)
     if [ -n "$have" ]; then
         have_major=${have%%.*}
         have_minor=${have##*.}
@@ -82,9 +96,12 @@ ${MIN_GLIBC_MAJOR}.${MIN_GLIBC_MINOR} or newer.
 fi
 
 if [ -z "$VERSION" ]; then
-    VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" |
-        grep -m1 '"tag_name"' | cut -d'"' -f4) ||
+    # Downloaded whole and read afterwards. Piping curl straight into a
+    # grep that stops at the first match kills curl with EPIPE, which
+    # under `pipefail` is indistinguishable from GitHub being down.
+    latest=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest") ||
         die "could not ask GitHub for the latest release"
+    VERSION=$(printf '%s\n' "$latest" | grep '"tag_name"' | cut -d'"' -f4)
     [ -n "$VERSION" ] || die "could not work out the latest release; pass --version"
 fi
 
@@ -101,8 +118,9 @@ curl -fsSL "${base}/SHA256SUMS" -o "${work}/SHA256SUMS" ||
     die "could not download SHA256SUMS, so the archive cannot be verified"
 
 # Compared by hand rather than with `shasum -c`, whose handling of a
-# missing entry differs between the two tools this might be using.
-want=$(grep -E "[ /]${archive}\$" "${work}/SHA256SUMS" | cut -d' ' -f1 | head -1)
+# missing entry differs between the two tools this might be using. The
+# name is anchored at both ends, so exactly one line can match.
+want=$(grep -E "[ /]${archive}\$" "${work}/SHA256SUMS" | cut -d' ' -f1)
 [ -n "$want" ] || die "SHA256SUMS has no entry for ${archive}"
 got=$(sha256 "${work}/${archive}")
 [ "$want" = "$got" ] || die "checksum mismatch for ${archive}
@@ -126,9 +144,12 @@ note "installed ${PREFIX}/bin/boombox"
 # ALSA is linked at startup, so without it the binary does not run at
 # all. Said after installing, because it is a thing to go and do rather
 # than a reason to stop.
-if [ "$os" = "unknown-linux-gnu" ] && ! "${PREFIX}/bin/boombox" --version >/dev/null 2>&1; then
+if [ "$os" = "unknown-linux-gnu" ] && ! why=$("${PREFIX}/bin/boombox" --version 2>&1); then
     note ""
-    note "it did not start, which usually means ALSA is missing:"
+    note "it is installed, but it did not start:"
+    printf '%s\n' "$why" | while IFS= read -r line; do note "  $line"; done
+    note ""
+    note "most often that is ALSA missing:"
     note "  sudo apt install libasound2      # Debian, Ubuntu"
     note "  sudo dnf install alsa-lib        # Fedora"
     exit 1
