@@ -421,12 +421,12 @@ and once more to go back to the cover.
 A real FFT over the audio librespot is decoding — not a decoration driven by
 the progress bar.
 
-![Pressing v to cycle from bars to the spectrogram and back to the cover
-art](media/visualisers.gif)
+![Pressing v to cycle from bars to the spectrogram and back to the cover art,
+then the fire burning the spectrum](media/visualisers.gif)
 
-| bars | spectrogram | oscilloscope |
-|---|---|---|
-| ![](media/bars.png) | ![](media/spectrogram.png) | ![](media/oscilloscope.png) |
+| bars | spectrogram | oscilloscope | fire |
+|---|---|---|---|
+| ![](media/bars.png) | ![](media/spectrogram.png) | ![](media/oscilloscope.png) | ![](media/fire.png) |
 
 The samples are tapped by wrapping librespot's `Sink`, so nothing in librespot
 is patched: the decorator copies each packet on its way to the speakers.
