@@ -35,6 +35,8 @@ ignore = [
     # The rustls 0.22 generation, via hyper-proxy2 -> librespot-core. Our
     # own path already uses the current rustls and webpki.
     { id = "RUSTSEC-2026-0285", reason = "rustls 0.22, reached via hyper-proxy2" },
+    { id = "RUSTSEC-2026-0346", reason = "rustls 0.22, reached via hyper-proxy2" },
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.22, reached via hyper-proxy2" },
     { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102, reached via hyper-proxy2" },
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102, reached via hyper-proxy2" },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102, reached via hyper-proxy2" },
