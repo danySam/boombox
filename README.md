@@ -166,6 +166,41 @@ The shortest route: Homebrew downloads a prebuilt binary, so this takes
 seconds and needs nothing on the machine first. Streaming is included, so
 boombox appears in Spotify's device list and can play the audio itself.
 
+### Debian and Ubuntu
+
+Every release carries a `.deb` for amd64 and arm64:
+
+```console
+curl -LO https://github.com/danySam/boombox/releases/download/v0.3.1/boombox_0.3.1-1_amd64.deb
+sudo apt install ./boombox_0.3.1-1_amd64.deb
+boombox setup
+```
+
+apt pulls ALSA in for you and refuses up front on a system too old to
+run it, rather than letting it install and fail at launch with a loader
+error. It needs glibc 2.34 or newer, so Ubuntu 22.04, Debian 12 and
+anything after.
+
+### One line
+
+For a Linux or macOS machine without Homebrew or apt:
+
+```console
+curl -fsSL https://raw.githubusercontent.com/danySam/boombox/main/scripts/install.sh | bash
+```
+
+It works out which binary this machine needs, checks it against the
+published `SHA256SUMS` before unpacking, and installs to `~/.local/bin`
+— no root. `--prefix` puts it somewhere else and `--version` picks a
+release other than the latest; pipe through `bash -s -- --prefix /opt`
+to pass them.
+
+Piping a script into a shell is a thing worth being wary of, so this one
+is [kept in the repository](scripts/install.sh) where it can be read
+first. It verifies before it installs, never asks for root, and turns a
+machine away with an explanation when the binaries cannot run on it
+rather than installing something broken.
+
 ### Prebuilt binaries
 
 Every release carries one tarball per platform, built by CI from the
@@ -212,6 +247,10 @@ boombox setup
 
 That gives you the CLI and the TUI, driving Spotify on your other devices —
 your phone, the desktop app, a speaker. For audio on this machine, read on.
+
+[`cargo binstall boombox`](https://github.com/cargo-bins/cargo-binstall)
+also works, and needs no compiler: the release archives are named the way
+it expects, so it finds and unpacks the right one by itself.
 
 #### Audio on this machine
 
