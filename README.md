@@ -1,7 +1,3 @@
-![boombox: a Spotify client for the terminal. The fire visualiser burning
-across the width of a terminal, with the track name and progress bar along the
-bottom](media/social-preview.png)
-
 # boombox
 
 A Spotify client for the terminal: a TUI and a scriptable CLI over the same core.
@@ -12,11 +8,11 @@ $ boombox now --json | jq -r .track.name
 $ boombox            # opens the TUI
 ```
 
-![Pressing v to cycle the visualisers: bars, then the spectrogram, back to the
-cover art, then the fire burning the spectrum](media/visualisers.gif)
-
 ![boombox playing a track: cover art, title, artist and album above the player
 bar](media/main_view.png)
+
+![Pressing v to cycle the visualisers: bars, then the spectrogram, back to the
+cover art, then the fire burning the spectrum](media/visualisers.gif)
 
 boombox is an independent project. It is not affiliated with, endorsed by or
 connected to Spotify; Spotify is a trademark of Spotify AB. Track, album,
