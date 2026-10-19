@@ -685,6 +685,14 @@ async fn ensure_not_already_running(path: &Path) -> Result<()> {
 const RECONNECT_FIRST: Duration = Duration::from_secs(2);
 #[cfg(feature = "streaming")]
 const RECONNECT_MAX: Duration = Duration::from_secs(60);
+/// How often to try again while Spotify cannot be reached at all.
+///
+/// Fixed rather than backed off: with no network an attempt fails in
+/// milliseconds and costs nothing, and the backoff above had climbed to a
+/// minute by the time a long outage ended, leaving the music off for up to
+/// that long after the network came back.
+#[cfg(feature = "streaming")]
+const RECONNECT_UNREACHABLE: Duration = Duration::from_secs(3);
 
 /// Keeps a Connect device registered for as long as the daemon runs.
 ///
@@ -818,19 +826,42 @@ fn resume_for(state: Option<&PlaybackState>, ours: &str) -> Option<Resume> {
 /// sounds final would be the wrong thing to leave on screen.
 #[cfg(feature = "streaming")]
 fn no_device_reason(e: &anyhow::Error) -> String {
-    let text = format!("{e:#}").to_lowercase();
-    // Matched on text because these arrive as librespot's own error
-    // types through anyhow, with no variant left to match on. Wrong
-    // guesses fall through to the general wording, which is still true.
-    let unreachable =
-        ["service unavailable", "error sending request", "resolve", "dns", "os error"]
-            .iter()
-            .any(|needle| text.contains(needle));
-    if unreachable {
+    if is_unreachable(e) {
         "cannot reach Spotify; reconnecting".into()
     } else {
         "no Connect device yet; retrying".into()
     }
+}
+
+/// Whether a failure to register means Spotify could not be reached at
+/// all -- no network, no DNS -- rather than reached and refusing.
+///
+/// The two want different retry timing. A retry with no network fails in
+/// milliseconds, spends no quota and is never seen by Spotify, so the only
+/// cost of waiting is music staying off after the network is back. A
+/// refusal is the opposite: retrying fast changes nothing and leans on
+/// their service. Shared with the reason shown on screen, so the two
+/// cannot disagree about which kind of failure this was.
+///
+/// Matched on text because these arrive as librespot's own error types
+/// through anyhow, with no variant left to match on. Anything not
+/// recognised counts as a refusal and gets the slower backoff, which is
+/// the cautious side to be wrong on.
+#[cfg(feature = "streaming")]
+fn is_unreachable(e: &anyhow::Error) -> bool {
+    let text = format!("{e:#}").to_lowercase();
+    [
+        "client error (connect)",
+        "error sending request",
+        "failed to lookup address",
+        "dns error",
+        "can't assign requested address",
+        "network is unreachable",
+        "network is down",
+        "no route to host",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 #[cfg(feature = "streaming")]
@@ -908,6 +939,10 @@ async fn supervise_streaming(
     shutdown: &mut watch::Receiver<bool>,
 ) {
     let mut backoff = RECONNECT_FIRST;
+    // Unreachable failures retry on their own short interval and leave the
+    // backoff alone, so an outage does not leave it at its ceiling for the
+    // first refusal that follows.
+    let mut unreachable = false;
     let mut first = true;
     // Carried from the session that died to the one that replaces it. A
     // reconnect registers a new device id and leaves the account with no
@@ -1008,6 +1043,7 @@ async fn supervise_streaming(
                 }
             }
             Err(e) => {
+                unreachable = is_unreachable(&e);
                 *daemon.streaming_state.write().await =
                     StreamingState::Unavailable(no_device_reason(&e));
                 // Once at startup, then quietly: a machine with no audio
@@ -1029,11 +1065,15 @@ async fn supervise_streaming(
             }
         }
 
+        let retry_soon = std::mem::take(&mut unreachable);
+        let wait = if retry_soon { RECONNECT_UNREACHABLE } else { backoff };
         tokio::select! {
-            () = tokio::time::sleep(backoff) => {}
+            () = tokio::time::sleep(wait) => {}
             _ = shutdown.changed() => return,
         }
-        backoff = (backoff * 2).min(RECONNECT_MAX);
+        if !retry_soon {
+            backoff = (backoff * 2).min(RECONNECT_MAX);
+        }
     }
 }
 
@@ -2801,6 +2841,37 @@ mod tests {
         assert_eq!(wrote(&Request::Next), Some(Wrote::Track));
         assert_eq!(wrote(&Request::PlaybackState), None);
         assert_eq!(wrote(&Request::Devices), None);
+    }
+
+    /// Each of these was in the log during a real outage. All of them
+    /// fail in milliseconds and cost nothing to retry, so they must get
+    /// the short interval rather than the backoff.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn no_network_counts_as_unreachable() {
+        for seen in [
+            "could not register as a Connect device: Service unavailable { client error (Connect) }",
+            "Unknown error { failed to lookup address information: nodename nor servname provided, or not known }",
+            "Can't assign requested address (os error 49)",
+        ] {
+            assert!(is_unreachable(&anyhow::Error::msg(seen)), "should retry soon: {seen}");
+        }
+    }
+
+    /// Spotify reachable and refusing, or a problem on this machine: fast
+    /// retries change nothing, so these keep the backoff. Unrecognised
+    /// text has to land here too.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn a_refusal_or_a_local_fault_keeps_the_backoff() {
+        for seen in [
+            "this build has no audio backend compiled in",
+            "authentication failed: bad credentials",
+            "could not open the mixer: device busy",
+            "something nobody has seen before",
+        ] {
+            assert!(!is_unreachable(&anyhow::Error::msg(seen)), "should back off: {seen}");
+        }
     }
 
     /// The reason goes across the player, so it has to read as a
