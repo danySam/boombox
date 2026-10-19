@@ -804,11 +804,45 @@ fn taken_by_someone_else(active: Option<&str>, ours: &str, previous: Option<&str
     }
 }
 
+/// What became of a transfer Spotify had already accepted.
+///
+/// Acceptance and playback are different events: `PUT /me/player` answers
+/// as soon as Spotify has taken the request, which can be before the
+/// session it names has anything loaded to play. Only one of these means
+/// the music came back.
+#[cfg(feature = "streaming")]
+#[derive(Debug, PartialEq, Eq)]
+enum Settled {
+    /// Audio reached the sink. The only outcome that means it worked.
+    Playing,
+    /// It never started, and the local player would not start it.
+    Silent,
+    /// Something was asked for while this waited, which is a newer
+    /// intention than the one being restored.
+    Superseded,
+    /// No local player to listen to or to ask, so there is nothing
+    /// honest to say either way.
+    Unverifiable,
+}
+
+#[cfg(feature = "streaming")]
+impl std::fmt::Display for Settled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Playing => f.write_str("playing"),
+            Self::Silent => f.write_str("silent"),
+            Self::Superseded => f.write_str("superseded"),
+            Self::Unverifiable => f.write_str("unverifiable"),
+        }
+    }
+}
+
 /// How an attempt to make this machine's device the active one ended.
 #[cfg(feature = "streaming")]
 #[derive(Debug, PartialEq, Eq)]
 enum Took {
-    /// Spotify accepted the transfer.
+    /// Spotify accepted the transfer. Not the same as playing: see
+    /// [`Settled`].
     Yes,
     /// Something was already playing, so it was left where it was.
     Busy,
@@ -1576,10 +1610,27 @@ impl Daemon {
         // that says the connection went and never says what became of it
         // is what made this take an investigation to pin down.
         match &took {
-            Took::Yes if was.playing => tracing::warn!(
-                was = %was.id, now = %device_id,
-                "reconnected and resumed playback on {device_name}"
-            ),
+            Took::Yes if was.playing => match self.settle_into_playing().await {
+                Settled::Playing => tracing::warn!(
+                    was = %was.id, now = %device_id,
+                    "reconnected and resumed playback on {device_name}"
+                ),
+                Settled::Silent => tracing::warn!(
+                    was = %was.id, now = %device_id,
+                    "reconnected as {device_name} and Spotify accepted playback, but no audio \
+                     is reaching it. Press play to start it again"
+                ),
+                Settled::Superseded => tracing::warn!(
+                    was = %was.id, now = %device_id,
+                    "reconnected as {device_name}; stopped restoring playback because \
+                     something else was asked for while it was starting"
+                ),
+                Settled::Unverifiable => tracing::warn!(
+                    was = %was.id, now = %device_id,
+                    "reconnected as {device_name} and Spotify accepted playback; no local \
+                     player was there to confirm it started"
+                ),
+            },
             Took::Yes => tracing::warn!(
                 was = %was.id, now = %device_id,
                 "reconnected; {device_name} is active again, still paused"
@@ -1593,6 +1644,67 @@ impl Daemon {
                 "reconnected as {device_name}, but playback was not restored: {other}"
             ),
         }
+    }
+
+    /// Waits for an accepted transfer to actually make sound, asking the
+    /// local player again if it does not.
+    ///
+    /// Spotify answers a transfer the moment it accepts one, which can be
+    /// before the session it names has loaded anything -- and a session
+    /// that has just reported no context sits there active and silent
+    /// while the log says playback was restored. Audio arriving at the
+    /// sink is the only evidence that recovery worked, so that is what
+    /// this waits for.
+    ///
+    /// Everything here is local. The tap is fed by our own decoder and
+    /// `Spirc` speaks over the Connect session, so none of it spends a Web
+    /// API request or can be refused by a cooldown -- which matters,
+    /// because the reconnect this follows may have been caused by one.
+    #[cfg(feature = "streaming")]
+    async fn settle_into_playing(&self) -> Settled {
+        let Some(tap) = self.spectrum.read().await.clone() else {
+            return Settled::Unverifiable;
+        };
+        let asked_before = self.stats.last_request_millis.load(Ordering::Relaxed);
+
+        // A push of samples sets the tap's clock back to zero, so a figure
+        // that falls is sound arriving while we watched. Compared against
+        // the highest seen rather than against a wall clock: a tap is
+        // created with its clock already running, and the last audio of
+        // the session that died is not evidence that this one started.
+        let mut longest = tap.since_audio();
+
+        for nudge in 0..=RESUME_NUDGES {
+            for _ in 0..SETTLE_POLLS {
+                tokio::time::sleep(SETTLE_POLL).await;
+                let since = tap.since_audio();
+                if since < longest {
+                    return Settled::Playing;
+                }
+                longest = since;
+                // Checked inside the wait rather than after it: somebody
+                // pausing a machine that will not stop is exactly the
+                // moment not to spend fifteen more seconds starting it.
+                if self.stats.last_request_millis.load(Ordering::Relaxed) != asked_before {
+                    return Settled::Superseded;
+                }
+            }
+
+            if nudge == RESUME_NUDGES {
+                break;
+            }
+            let Some(spirc) = self.spirc.read().await.clone() else {
+                return Settled::Unverifiable;
+            };
+            if let Err(e) = spirc.play() {
+                // A local player that refuses is a player whose session is
+                // going. Asking it twice more would only say so twice more.
+                tracing::debug!("the local player would not start: {e}");
+                return Settled::Silent;
+            }
+            tracing::debug!(nudge = nudge + 1, "nothing is reaching the sink; asked again");
+        }
+        Settled::Silent
     }
 
     /// Waits for `device_id` to be listed, then makes it the active device
@@ -2037,6 +2149,23 @@ const START_TIMEOUT: Duration = Duration::from_secs(12);
 const ADOPT_WAIT: Duration = Duration::from_secs(30);
 #[cfg(feature = "streaming")]
 const ADOPT_POLL: Duration = Duration::from_secs(2);
+
+/// How often the audio tap is read while waiting for an accepted transfer
+/// to start making sound.
+#[cfg(feature = "streaming")]
+const SETTLE_POLL: Duration = Duration::from_millis(250);
+/// How many of those reads a transfer gets before the local player is
+/// asked again: five seconds, which is enough for librespot to fetch and
+/// decode the start of a track over a connection that has just come back.
+#[cfg(feature = "streaming")]
+const SETTLE_POLLS: u32 = 20;
+/// How many times the local player is asked to play before this gives up.
+///
+/// Bounded, and deliberately short. Music coming back a minute after a
+/// drop is a gap nobody minds; music starting up ten minutes after
+/// somebody walked away from a silent machine is worse than silence.
+#[cfg(feature = "streaming")]
+const RESUME_NUDGES: u32 = 3;
 
 /// What [`ensure_running`] had to do, so the caller can say so rather than
 /// leaving the user to wonder why playback stopped.
@@ -2625,6 +2754,68 @@ mod tests {
         assert_eq!(wrote(&Request::Next), Some(Wrote::Track));
         assert_eq!(wrote(&Request::PlaybackState), None);
         assert_eq!(wrote(&Request::Devices), None);
+    }
+
+    /// A transfer that starts playing is the ordinary case, and the one
+    /// that has to stay quiet: no nudging, no waiting out the full window.
+    #[cfg(feature = "streaming")]
+    #[tokio::test(start_paused = true)]
+    async fn audio_arriving_is_what_counts_as_resumed() {
+        let daemon = offline_daemon();
+        let tap = Arc::new(crate::spectrum::SpectrumTap::new(44_100));
+        *daemon.spectrum.write().await = Some(Arc::clone(&tap));
+
+        // The decoder starting up, a little after the transfer landed.
+        let feeding = Arc::clone(&tap);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            feeding.push_interleaved(&[0.4, 0.4], 2);
+        });
+
+        assert_eq!(daemon.settle_into_playing().await, Settled::Playing);
+    }
+
+    /// The failure this exists for: Spotify accepted the transfer, the
+    /// session had nothing loaded, and nothing ever reached the sink. With
+    /// no local player to ask, the honest answer is that it cannot be
+    /// confirmed -- never that playback resumed.
+    #[cfg(feature = "streaming")]
+    #[tokio::test(start_paused = true)]
+    async fn a_transfer_that_never_makes_a_sound_is_not_called_resumed() {
+        let daemon = offline_daemon();
+        *daemon.spectrum.write().await = Some(Arc::new(crate::spectrum::SpectrumTap::new(44_100)));
+
+        let settled = daemon.settle_into_playing().await;
+        assert_ne!(settled, Settled::Playing, "silence must never read as resumed");
+        assert_eq!(settled, Settled::Unverifiable, "there was no local player to ask");
+    }
+
+    /// Someone pausing a machine that will not stop is a newer intention
+    /// than the one being restored, and waiting out the window to start it
+    /// again is the opposite of what they asked for.
+    #[cfg(feature = "streaming")]
+    #[tokio::test(start_paused = true)]
+    async fn a_command_while_it_waits_wins() {
+        let daemon = offline_daemon();
+        *daemon.spectrum.write().await = Some(Arc::new(crate::spectrum::SpectrumTap::new(44_100)));
+
+        let stats = Arc::clone(&daemon.stats);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            // What `forward` does when a request arrives.
+            stats.last_request_millis.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(daemon.settle_into_playing().await, Settled::Superseded);
+    }
+
+    /// Without streaming compiled in there is no tap, and a daemon driving
+    /// somebody else's speaker has no way to hear whether it worked.
+    #[cfg(feature = "streaming")]
+    #[tokio::test(start_paused = true)]
+    async fn with_no_local_player_it_says_so_rather_than_guessing() {
+        let daemon = offline_daemon();
+        assert_eq!(daemon.settle_into_playing().await, Settled::Unverifiable);
     }
 
     /// handling that does not touch the network.
