@@ -8,8 +8,6 @@
 //! Spotify permits one active stream per account, so this is a handoff: when
 //! playback transfers here, whatever was playing elsewhere stops.
 
-use std::fs;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,65 +27,7 @@ use librespot::playback::mixer::{self, MixerConfig};
 use librespot::playback::player::Player;
 use librespot::playback::{NUM_CHANNELS, SAMPLE_RATE};
 
-use uuid::Uuid;
-
 use crate::spectrum::SpectrumTap;
-
-/// What the saved device id is called in the state directory.
-const DEVICE_ID_FILE: &str = "device-id";
-
-/// The Connect device id this machine keeps between sessions.
-///
-/// librespot mints a fresh UUID per session, so without this every
-/// reconnect registers as a device Spotify has never seen: one vanishes,
-/// an unrelated one appears, and the daemon has to transfer playback
-/// across to it. That transfer races the new session's own startup, and
-/// losing the race leaves the device active with no context to play --
-/// accepted, silent, and indistinguishable from success.
-///
-/// Keeping the id means a reconnect re-registers as the device Spotify
-/// already knows, which is the difference between restoring playback and
-/// moving it.
-///
-/// Falling back to a fresh id when the state directory cannot be read or
-/// written is deliberate: that is the old behaviour, and it is not worth
-/// refusing to play music over.
-fn stable_device_id() -> String {
-    match boombox_core::config::state_dir() {
-        Ok(dir) => device_id_in(&dir),
-        Err(e) => {
-            tracing::warn!("no state directory for the device id ({e}); using a fresh one");
-            Uuid::new_v4().as_hyphenated().to_string()
-        }
-    }
-}
-
-/// The saved id under `dir`, writing one if there is nothing usable there.
-///
-/// Parsed rather than trusted. A truncated or hand-edited file would
-/// otherwise be handed to Spotify as this machine's identity, and an id it
-/// rejects is harder to diagnose than one that was quietly replaced.
-fn device_id_in(dir: &Path) -> String {
-    let path = dir.join(DEVICE_ID_FILE);
-    if let Ok(saved) = fs::read_to_string(&path) {
-        let saved = saved.trim();
-        if Uuid::try_parse(saved).is_ok() {
-            return saved.to_string();
-        }
-        tracing::warn!(
-            path = %path.display(),
-            "the saved device id is not a UUID; replacing it"
-        );
-    }
-
-    let fresh = Uuid::new_v4().as_hyphenated().to_string();
-    if let Err(e) = fs::create_dir_all(dir).and_then(|()| fs::write(&path, &fresh)) {
-        // Not fatal: an id that is not written back is simply the old
-        // per-session behaviour, for this run only.
-        tracing::warn!(path = %path.display(), "could not save the device id: {e}");
-    }
-    fresh
-}
 
 /// Loopback redirect for the streaming login. Any loopback port is accepted
 /// by Spotify's own client; this one matches librespot's example.
@@ -351,13 +291,12 @@ pub async fn start(config: &Config) -> Result<Streaming> {
     )?;
 
     // Deliberately NOT our Web API client_id -- see login() for why.
-    let session_config =
-        SessionConfig { device_id: stable_device_id(), ..SessionConfig::default() };
-    let session = Session::new(session_config, Some(cache));
+    let session = Session::new(SessionConfig::default(), Some(cache));
 
-    // Taken before Spirc consumes the session. librespot publishes this as
-    // the Connect device's id, and it is the same id the Web API reports --
-    // so it, and not the name, is how the daemon recognises its own device.
+    // Taken before Spirc consumes the session. librespot makes this a fresh
+    // UUID per process and publishes it as the Connect device's id, which is
+    // the same id the Web API then reports -- so it, and not the name, is how
+    // the daemon recognises its own device.
     let device_id = session.device_id().to_string();
     // A Session is an Arc inside, so this is a handle to the same one Spirc
     // is about to take, kept so its liveness can be watched.
@@ -420,65 +359,6 @@ pub async fn start(config: &Config) -> Result<Streaming> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("boombox-devid-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// The reason the file exists. A reconnect that registers under a new
-    /// id is a new device as far as Spotify is concerned, and playback has
-    /// to be chased across to it.
-    #[test]
-    fn the_device_id_survives_the_session_that_made_it() {
-        let dir = scratch("stable");
-        let first = device_id_in(&dir);
-        assert_eq!(first, device_id_in(&dir), "the same machine keeps the same id");
-        assert!(Uuid::try_parse(&first).is_ok(), "and it is a UUID Spotify will accept");
-    }
-
-    /// Spotify is handed this as an identity, so a file that is not one has
-    /// to be replaced rather than passed along.
-    #[test]
-    fn a_damaged_device_id_is_replaced_rather_than_published() {
-        let dir = scratch("damaged");
-        let path = dir.join(DEVICE_ID_FILE);
-        fs::write(&path, "not-a-uuid").unwrap();
-
-        let id = device_id_in(&dir);
-        assert!(Uuid::try_parse(&id).is_ok(), "a usable id comes back");
-        assert_eq!(id, device_id_in(&dir), "and the replacement is kept");
-    }
-
-    /// Written by hand or copied between machines, it may well arrive with
-    /// a trailing newline.
-    #[test]
-    fn surrounding_whitespace_does_not_make_a_new_device() {
-        let dir = scratch("spaced");
-        let id = Uuid::new_v4().as_hyphenated().to_string();
-        fs::write(dir.join(DEVICE_ID_FILE), format!("  {id}\n")).unwrap();
-
-        assert_eq!(device_id_in(&dir), id);
-    }
-
-    /// An unwritable state directory is a reason to carry on with a fresh
-    /// id, not a reason to refuse to stream.
-    #[test]
-    fn an_unusable_state_directory_still_yields_an_id() {
-        let dir = scratch("blocked").join("device-id");
-        // A file where the directory should be: create_dir_all and write
-        // both fail, which is the shape of a state directory we cannot use.
-        fs::write(&dir, "in the way").unwrap();
-
-        let id = device_id_in(&dir);
-        assert!(Uuid::try_parse(&id).is_ok(), "streaming still gets an id to register with");
-        // Nothing could be saved, so the next call cannot find one. Asserted
-        // because an id that happened to persist here would mean the test
-        // was not exercising the failure it claims to.
-        assert_ne!(id, device_id_in(&dir), "with nowhere to save it, each session differs");
-    }
 
     /// The whole point: a session whose connection has gone must be
     /// noticed promptly, not when the protocol task eventually gives up.
