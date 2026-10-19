@@ -411,6 +411,14 @@ struct Stats {
     /// Zero means none yet, which wants the same treatment: a daemon nobody
     /// has spoken to since boot has no one to keep a cache warm for.
     last_request_millis: AtomicU64,
+    /// How many commands that change playback have been asked for.
+    ///
+    /// Distinct from `last_request_millis`, which moves for every line a
+    /// client sends: an open TUI polls the visualiser dozens of times a
+    /// second, and none of that is somebody asking for anything. Only a
+    /// change in this one means a newer intention than whatever recovery
+    /// is in the middle of restoring.
+    playback_commands: AtomicU64,
 }
 
 /// A pause Spotify asked for, and why.
@@ -1315,6 +1323,12 @@ impl Daemon {
         }
 
         let recorded = wrote(&request);
+        // Counted on the way in rather than once Spotify accepts it: a
+        // pause that is refused is still somebody saying stop, and
+        // recovery should not carry on starting the music regardless.
+        if recorded.is_some() {
+            self.stats.playback_commands.fetch_add(1, Ordering::Relaxed);
+        }
         let response = match self.forward(request).await {
             Ok(response) => {
                 // Only once the write is accepted. A change Spotify refused
@@ -1665,7 +1679,7 @@ impl Daemon {
         let Some(tap) = self.spectrum.read().await.clone() else {
             return Settled::Unverifiable;
         };
-        let asked_before = self.stats.last_request_millis.load(Ordering::Relaxed);
+        let commands_before = self.stats.playback_commands.load(Ordering::Relaxed);
 
         // A push of samples sets the tap's clock back to zero, so a figure
         // that falls is sound arriving while we watched. Compared against
@@ -1685,7 +1699,7 @@ impl Daemon {
                 // Checked inside the wait rather than after it: somebody
                 // pausing a machine that will not stop is exactly the
                 // moment not to spend fifteen more seconds starting it.
-                if self.stats.last_request_millis.load(Ordering::Relaxed) != asked_before {
+                if self.stats.playback_commands.load(Ordering::Relaxed) != commands_before {
                     return Settled::Superseded;
                 }
             }
@@ -2802,11 +2816,53 @@ mod tests {
         let stats = Arc::clone(&daemon.stats);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(600)).await;
-            // What `forward` does when a request arrives.
-            stats.last_request_millis.fetch_add(1, Ordering::Relaxed);
+            // What `dispatch` does when a playback command arrives.
+            stats.playback_commands.fetch_add(1, Ordering::Relaxed);
         });
 
         assert_eq!(daemon.settle_into_playing().await, Settled::Superseded);
+    }
+
+    /// An open TUI polls the visualiser dozens of times a second, and the
+    /// first version of this watched the clock those requests bump -- so
+    /// recovery stood aside instantly whenever anyone was watching, which
+    /// is exactly when they would notice the music not coming back.
+    /// Reading state is not asking for anything.
+    #[cfg(feature = "streaming")]
+    #[tokio::test(start_paused = true)]
+    async fn a_watching_tui_does_not_count_as_changing_its_mind() {
+        let daemon = offline_daemon();
+        *daemon.spectrum.write().await = Some(Arc::new(crate::spectrum::SpectrumTap::new(44_100)));
+
+        let stats = Arc::clone(&daemon.stats);
+        tokio::spawn(async move {
+            // A visualiser at frame rate, for as long as this waits.
+            for _ in 0..600 {
+                tokio::time::sleep(Duration::from_millis(16)).await;
+                stats.requests.fetch_add(1, Ordering::Relaxed);
+                stats.last_request_millis.fetch_add(16, Ordering::Relaxed);
+            }
+        });
+
+        assert_ne!(
+            daemon.settle_into_playing().await,
+            Settled::Superseded,
+            "polling is traffic, not intent"
+        );
+    }
+
+    /// The requests a TUI makes constantly must not be mistaken for
+    /// commands; the ones it makes when somebody presses a key must be.
+    #[test]
+    fn only_requests_that_change_playback_count_as_commands() {
+        assert!(wrote(&Request::Pause).is_some(), "pause is intent");
+        assert!(wrote(&Request::Next).is_some(), "skipping is intent");
+        assert!(wrote(&Request::Seek { position_ms: 1000 }).is_some(), "seeking is intent");
+
+        assert!(wrote(&Request::PlaybackState).is_none(), "reading state is not");
+        assert!(wrote(&Request::Spectrum { bands: 32 }).is_none(), "the visualiser is not");
+        assert!(wrote(&Request::Waveform { points: 64 }).is_none(), "nor the waveform");
+        assert!(wrote(&Request::Devices).is_none(), "nor listing devices");
     }
 
     /// Without streaming compiled in there is no tap, and a daemon driving
