@@ -7,6 +7,7 @@ pub mod artwork;
 pub mod graphics;
 pub mod keymap;
 pub mod palette;
+mod remembered;
 pub mod sixel;
 pub mod ui;
 
@@ -144,6 +145,8 @@ where
     tracing::info!(protocol = ?app.graphics, "album art");
     app.daemon_version = options.daemon_version.clone();
     app.our_device_id = options.our_device_id.clone();
+    app.visual = remembered::visual();
+    let mut saved_visual = app.visual;
     // Before any frames are collected rather than after: the waterfall keeps
     // one per column, so it has to know how many columns there are. Nothing
     // resizes a terminal that is already the right size, so waiting for a
@@ -313,6 +316,13 @@ where
                         if let Some(action) = mapped {
                             if let Some(command) = app.update(action) {
                                 dispatch(&api, &tx, command);
+                            }
+                            // Written when it changes rather than on the
+                            // way out, so a TUI that is killed or whose
+                            // terminal closes still remembers.
+                            if app.visual != saved_visual {
+                                remembered::save_visual(app.visual);
+                                saved_visual = app.visual;
                             }
                             // Paging happens on cursor movement, not on a timer.
                             if let Some(more) = app.maybe_load_more() {

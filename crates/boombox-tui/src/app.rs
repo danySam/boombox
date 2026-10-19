@@ -472,6 +472,24 @@ impl VisualMode {
         }
     }
 
+    /// The name this mode is remembered under between runs. Stable
+    /// spellings rather than `label`, which is wording for people and
+    /// free to change.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Bars => "bars",
+            Self::Spectrogram => "spectrogram",
+            Self::Scope => "scope",
+            Self::Fire => "fire",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        [Self::Bars, Self::Spectrogram, Self::Scope, Self::Fire]
+            .into_iter()
+            .find(|m| m.key() == key)
+    }
+
     pub fn next(self) -> Self {
         match self {
             Self::Bars => Self::Spectrogram,
