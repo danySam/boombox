@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use boombox_core::api::{Entry, PlaybackState, PlayingItem};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -10,6 +12,9 @@ use crate::palette::Palette;
 
 const ACCENT: Color = Color::Green;
 const DIM: Color = Color::DarkGray;
+/// Something is wrong but nothing is lost: a reconnect in progress, not
+/// an error to act on. Yellow rather than red for that reason.
+const WARN: Color = Color::Yellow;
 
 /// The pause mark's off-phase: as many spaces as the mark takes columns.
 ///
@@ -75,9 +80,11 @@ pub fn draw(frame: &mut Frame, app: &App) -> Option<Rect> {
         palette(frame, chunks[0], app);
     }
     // The toast takes the legend's line rather than covering content: the
-    // legend is the most disposable thing on screen.
-    match app.visible_toast() {
-        Some(toast) => {
+    // legend is the most disposable thing on screen. An outage takes the
+    // same line, under a toast: a toast answers something just asked for
+    // and is gone in seconds, while the outage will still be there after.
+    match (app.visible_toast(), app.streaming_outage()) {
+        (Some(toast), _) => {
             let style = match toast.kind {
                 ToastKind::Error => Style::new().fg(Color::Red),
                 ToastKind::Info => Style::new().fg(Color::Yellow),
@@ -87,7 +94,16 @@ pub fn draw(frame: &mut Frame, app: &App) -> Option<Rect> {
                 chunks[1],
             );
         }
-        None => legend(frame, chunks[1], app),
+        (None, Some((why, since))) => {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    format!(" {}", outage_line(why, since)),
+                    Style::new().fg(WARN),
+                )),
+                chunks[1],
+            );
+        }
+        (None, None) => legend(frame, chunks[1], app),
     }
     // Above the browse panel, because it is the thing being answered.
     if let Some(buffer) = app.link_prompt() {
@@ -146,6 +162,18 @@ fn mnemonic(word: &str, key: char) -> Vec<Span<'static>> {
             Span::styled(word.to_string(), Style::new().fg(DIM)),
         ],
     }
+}
+
+/// What the player says while the daemon has no Connect session.
+///
+/// The elapsed time is there because the first second of an outage and
+/// the fortieth look identical otherwise, and they mean different things:
+/// one is a blip, the other is something to go and look at. Shown from
+/// the start rather than after a grace period -- a reader who glances
+/// down during a two-second reconnect should see why the music stopped,
+/// not an empty line.
+fn outage_line(why: &str, since: Duration) -> String {
+    format!("\u{26a0} {why} ({}s)", since.as_secs())
 }
 
 /// The keys that apply right now, spelled so the key is visible inside the
@@ -723,11 +751,25 @@ fn idle(frame: &mut Frame, area: Rect, app: &App, state: Option<&PlaybackState>)
         .constraints([Constraint::Min(10)])
         .split(chunks[1]);
 
-    let name = item.map(PlayingItem::name).unwrap_or("\u{2014}");
-    let byline = item.map(PlayingItem::byline).unwrap_or_default();
-    let line =
-        if byline.is_empty() { format!(" {name}") } else { format!(" {name}  \u{b7}  {byline}") };
-    frame.render_widget(Paragraph::new(Span::styled(line, Style::new().fg(DIM))), split[0]);
+    // An outage takes this line. Idle is the state someone is in when
+    // they have stopped touching the keyboard and are watching the
+    // visualiser, which is exactly when the music stopping needs saying
+    // -- and the track name on this line is the one thing they already
+    // know.
+    let (line, style) = match app.streaming_outage() {
+        Some((why, since)) => (format!(" {}", outage_line(why, since)), Style::new().fg(WARN)),
+        None => {
+            let name = item.map(PlayingItem::name).unwrap_or("\u{2014}");
+            let byline = item.map(PlayingItem::byline).unwrap_or_default();
+            let line = if byline.is_empty() {
+                format!(" {name}")
+            } else {
+                format!(" {name}  \u{b7}  {byline}")
+            };
+            (line, Style::new().fg(DIM))
+        }
+    };
+    frame.render_widget(Paragraph::new(Span::styled(line, style)), split[0]);
 
     progress(frame, chunks[2], state, &app.envelope);
 }
@@ -2502,6 +2544,47 @@ mod tests {
         assert!(!text.contains("[l]iked"), "the legend stands aside: {text}");
     }
 
+    /// The point of the whole thing: a daemon that has lost its session
+    /// keeps answering playback from its cache, so without this the
+    /// player looks exactly as it did a second ago and the music simply
+    /// stops.
+    #[test]
+    fn a_lost_connection_is_said_on_the_legends_line() {
+        let mut app = playing_app();
+        app.set_streaming_outage(Some("the connection dropped; reconnecting".into()));
+        let text = render(&app, 110, 12);
+        assert!(text.contains("reconnecting"), "{text}");
+        assert!(!text.contains("[l]iked"), "the legend stands aside: {text}");
+    }
+
+    /// It has to stop saying it, too. An indicator that outlives the
+    /// outage is worse than none: it teaches people to ignore it.
+    #[test]
+    fn the_legend_comes_back_once_the_session_does() {
+        let mut app = playing_app();
+        app.set_streaming_outage(Some("the connection dropped; reconnecting".into()));
+        app.set_streaming_outage(None);
+        let text = render(&app, 110, 12);
+        assert!(!text.contains("reconnecting"), "{text}");
+        assert!(text.contains("[l]iked"), "the legend is back: {text}");
+    }
+
+    /// A toast answers something just asked for and is gone in seconds;
+    /// the outage will still be there afterwards, so the toast goes on
+    /// top and the outage reappears underneath it.
+    #[test]
+    fn a_toast_outranks_an_outage_but_only_while_it_lasts() {
+        let mut app = playing_app();
+        app.set_streaming_outage(Some("the connection dropped; reconnecting".into()));
+        app.info("added to queue");
+        let text = render(&app, 110, 12);
+        assert!(text.contains("added to queue"), "the toast wins: {text}");
+        assert!(!text.contains("reconnecting"), "{text}");
+
+        app.toast = None;
+        assert!(render(&app, 110, 12).contains("reconnecting"), "and the outage returns");
+    }
+
     #[test]
     fn the_player_bar_is_pinned_across_every_stage() {
         let mut app = playing_app();
@@ -2582,6 +2665,24 @@ mod tests {
         assert_eq!(text.matches("1:00").count(), 1, "exactly one clock, not two: {text}");
         assert!(text.contains("\u{2501}"), "and the progress bar: {text}");
         assert!(!text.contains("\u{21c4}"), "but the shuffle/repeat row goes: {text}");
+    }
+
+    /// Idle is someone watching the visualiser with their hands off the
+    /// keyboard, so it is the state the music is most likely to die in
+    /// unnoticed. The cached playback still reads as playing through an
+    /// outage, which is what keeps the TUI in this view at all.
+    #[test]
+    fn an_outage_is_said_in_the_idle_view_too() {
+        let mut app = playing_app();
+        app.cycle_visual();
+        app.set_spectrum(vec![0.5; 64]);
+        app.last_input = std::time::Instant::now() - std::time::Duration::from_secs(30);
+        assert!(app.is_idle(), "the visualiser is up and nobody has touched anything");
+
+        app.set_streaming_outage(Some("the connection dropped; reconnecting".into()));
+        let text = render(&app, 72, 16);
+        assert!(text.contains("reconnecting"), "{text}");
+        assert!(text.contains("\u{2501}"), "the progress bar stays: {text}");
     }
 
     /// An empty byline must not leave a separator pointing at nothing.

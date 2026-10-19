@@ -22,7 +22,7 @@ use boombox_core::recent::Recent;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
 
-pub use protocol::{DaemonStatus, Request, Response, WireError, WireErrorKind};
+pub use protocol::{DaemonStatus, Request, Response, StreamingState, WireError, WireErrorKind};
 
 /// Talks to a running daemon. Implements [`PlayerApi`], so the front ends
 /// cannot tell whether they are speaking to the daemon or to Spotify.
@@ -294,6 +294,26 @@ impl SpectrumApi for IpcClient {
             Response::Error(e) => Err(e.into()),
             other => Err(unexpected(&other)),
         }
+    }
+
+    async fn streaming_outage(&self) -> Result<Option<String>> {
+        match self.request(Request::Ping).await? {
+            Response::Pong(status) => Ok(outage_reason(status.streaming_state)),
+            Response::Error(e) => Err(e.into()),
+            other => Err(unexpected(&other)),
+        }
+    }
+}
+
+/// An outage worth interrupting someone over, or nothing.
+///
+/// Only `Unavailable` is an outage. The rest are settings and build
+/// choices: a daemon with streaming switched off is not having a bad day,
+/// and saying so over the player would be noise on every frame for ever.
+fn outage_reason(state: Option<StreamingState>) -> Option<String> {
+    match state {
+        Some(StreamingState::Unavailable(why)) => Some(why),
+        _ => None,
     }
 }
 

@@ -54,6 +54,20 @@ pub trait SpectrumApi: Send + Sync {
     fn audio_stalled_secs(&self) -> impl Future<Output = Result<Option<u64>>> + Send {
         async { Ok(None) }
     }
+
+    /// Why this machine has no Connect session at the moment, when it has
+    /// none: "the connection dropped; reconnecting" and the like. `None`
+    /// means the session is live, or that there was never one to lose.
+    ///
+    /// A front end polling a daemon over a local socket sees nothing of an
+    /// outage otherwise -- playback keeps being answered from the cache,
+    /// which looks exactly like everything working.
+    ///
+    /// Only a daemon running the session can know, so the default is
+    /// nothing, which is the honest answer from anywhere else.
+    fn streaming_outage(&self) -> impl Future<Output = Result<Option<String>>> + Send {
+        async { Ok(None) }
+    }
 }
 
 impl SpectrumApi for Client {

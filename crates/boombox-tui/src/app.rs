@@ -741,6 +741,12 @@ pub struct App {
     pub last_input: Instant,
 
     pub toast: Option<Toast>,
+    /// Why the daemon has no Connect session, and since when.
+    ///
+    /// The instant is kept rather than a count of seconds so the line can
+    /// say how long it has been trying without the daemon having to send
+    /// a new number every tick.
+    streaming_outage: Option<(String, Instant)>,
     pub show_help: bool,
     pub should_quit: bool,
     pub connected_to_daemon: bool,
@@ -828,6 +834,7 @@ impl App {
             browse_open: false,
             last_input: Instant::now(),
             toast: None,
+            streaming_outage: None,
             show_help: false,
             should_quit: false,
             connected_to_daemon,
@@ -1464,6 +1471,26 @@ impl App {
 
     pub fn visible_toast(&self) -> Option<&Toast> {
         self.toast.as_ref().filter(|t| t.at.elapsed() < TOAST_TTL)
+    }
+
+    /// Takes what the daemon says about its Connect session.
+    ///
+    /// The same reason arriving again is the same outage carrying on, so
+    /// the clock is left where it was: an indicator that restarted its
+    /// count every second would say nothing about how long this has gone
+    /// on, which is the one thing it is there to say.
+    pub fn set_streaming_outage(&mut self, outage: Option<String>) {
+        match (outage, &self.streaming_outage) {
+            (Some(why), Some((already, _))) if *already == why => {}
+            (Some(why), _) => self.streaming_outage = Some((why, Instant::now())),
+            (None, _) => self.streaming_outage = None,
+        }
+    }
+
+    /// What to say about a missing Connect session, and for how long it
+    /// has been missing. `None` when the session is fine.
+    pub fn streaming_outage(&self) -> Option<(&str, Duration)> {
+        self.streaming_outage.as_ref().map(|(why, since)| (why.as_str(), since.elapsed()))
     }
 
     fn list_len(&self) -> usize {
@@ -2327,6 +2354,39 @@ pub(crate) mod tests {
         app.set_entries(vec![entry("Mixtape")], 1, false);
         assert_eq!(app.update(Action::OpenPlaylists), None, "no refetch");
         assert_eq!(app.entries.len(), 1, "and nothing thrown away");
+    }
+
+    /// The daemon reports the outage once a second for as long as it
+    /// lasts. Each report is the same outage continuing, so the clock has
+    /// to keep running -- restarting it every tick would peg the display
+    /// at zero seconds, which is the one number it must never show after
+    /// the first.
+    #[test]
+    fn a_continuing_outage_keeps_counting_from_when_it_started() {
+        let mut app = App::new(5, true);
+        app.set_streaming_outage(Some("the connection dropped; reconnecting".into()));
+        let (_, first) = app.streaming_outage().expect("an outage is showing");
+
+        std::thread::sleep(Duration::from_millis(20));
+        app.set_streaming_outage(Some("the connection dropped; reconnecting".into()));
+        let (_, second) = app.streaming_outage().expect("still showing");
+
+        assert!(second > first, "the clock ran on: {first:?} then {second:?}");
+    }
+
+    /// A different reason is a different outage, so that one starts its
+    /// own clock rather than inheriting the last one's.
+    #[test]
+    fn a_new_reason_starts_a_new_clock() {
+        let mut app = App::new(5, true);
+        app.set_streaming_outage(Some("the connection dropped; reconnecting".into()));
+        std::thread::sleep(Duration::from_millis(20));
+        let (_, carried) = app.streaming_outage().expect("an outage is showing");
+
+        app.set_streaming_outage(Some("the session ended; reconnecting".into()));
+        let (why, fresh) = app.streaming_outage().expect("the new one is showing");
+        assert_eq!(why, "the session ended; reconnecting");
+        assert!(fresh < carried, "a new reason restarts the count");
     }
 
     #[test]

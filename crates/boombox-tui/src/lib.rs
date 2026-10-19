@@ -40,6 +40,11 @@ enum Message {
         append: bool,
     },
     Spectrum(Vec<f32>),
+    /// Why the daemon has no Connect session, or `None` once it has one
+    /// again. Sent on every health tick rather than only on a change, so
+    /// a TUI that starts during an outage is not left waiting for the
+    /// edge it already missed.
+    Streaming(Option<String>),
     /// A palette read from artwork, with the cover it came from so the
     /// result can be remembered. `None` means the cover had no usable colour.
     Artwork {
@@ -64,6 +69,11 @@ const PAGE: u32 = 50;
 /// How often to ask whether this computer has gone silent while playing.
 /// A local ping, so cheap; nobody needs to hear about it within the second.
 const SILENCE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the daemon is asked whether its Connect session is still
+/// there. A local socket round trip, so this is set by how long someone
+/// should sit in front of silence wondering, not by what it costs.
+const HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Spectrum refresh. A local socket round trip costs microseconds, so this is
 /// bounded by what looks smooth rather than by what is affordable.
@@ -162,6 +172,7 @@ where
     spawn_spectrum_poll(&api, &tx, Arc::clone(&spectrum_wanted), Arc::clone(&waveform_wanted));
     spawn_envelope_poll(&api, &tx);
     spawn_silence_poll(&api, &tx);
+    spawn_health_poll(&api, &tx);
     refresh_devices(&api, &tx);
     refresh_queue(&api, &tx);
 
@@ -254,6 +265,7 @@ where
                     app.accept_entries(&view, &query, entries, total, append)
                 }
                 Message::Spectrum(bands) => app.set_spectrum(bands),
+                Message::Streaming(outage) => app.set_streaming_outage(outage),
                 Message::Artwork { url, artwork } => {
                     // Only apply it if it is still the cover we are on: a
                     // slow fetch for the previous track must not repaint
@@ -456,6 +468,34 @@ where
                 }
                 Ok(None) => reported = false,
                 _ => {}
+            }
+        }
+    });
+}
+
+/// Watches for the daemon losing its Connect session.
+///
+/// Separate from the silence poll, which says one thing once per outage.
+/// This is a condition rather than an event: it has to keep being true
+/// for as long as it is, so the player can show it and stop showing it.
+fn spawn_health_poll<P>(api: &Arc<P>, tx: &mpsc::UnboundedSender<Message>)
+where
+    P: SpectrumApi + 'static,
+{
+    let api = Arc::clone(api);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HEALTH_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            // A failed ask is not an outage: the daemon may be busy or
+            // going away, and painting "connection lost" over a daemon
+            // that is merely slow to answer would be its own lie.
+            if let Ok(outage) = api.streaming_outage().await
+                && tx.send(Message::Streaming(outage)).is_err()
+            {
+                return;
             }
         }
     });
