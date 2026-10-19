@@ -116,8 +116,8 @@ pub struct Daemon {
     /// Held so pause and resume can go straight to it. Those are the
     /// controls people reach for first, and routing them through the Web
     /// API meant a rate limit took away the ability to stop audio coming
-    /// out of this very machine -- which is how 8 October ended with the
-    /// daemon being killed to get silence.
+    /// out of this very machine, leaving killing the daemon as the only
+    /// way to get silence.
     #[cfg(feature = "streaming")]
     spirc: Arc<RwLock<Option<Arc<librespot::connect::Spirc>>>>,
     /// Whether a Connect device is registered right now, and if not, why.
@@ -1549,8 +1549,8 @@ impl Daemon {
         // Spotify serves for a few seconds after a session dies is not
         // mistaken for somebody else having taken playback.
         // Every step below is a Web API call, so during a cooldown they can
-        // only be refused -- which is exactly how a reconnect lost playback
-        // on 14 October. Short restrictions are worth sitting out: the music
+        // only be refused, which is one way a reconnect loses playback
+        // outright. Short restrictions are worth sitting out: the music
         // was playing a moment ago and the gap goes unnoticed. Long ones are
         // not, because starting the music again an hour after somebody
         // walked away is worse than leaving it stopped.
@@ -2367,7 +2367,7 @@ mod tests {
         serde_json::from_str(POLLED).unwrap()
     }
 
-    /// The incident this exists for: the connection dropped while this
+    /// The case this exists for: the connection dropped while this
     /// machine was playing, the reconnect registered a different device id,
     /// and playback was left with nowhere to go until someone picked the
     /// device by hand.
