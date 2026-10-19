@@ -804,6 +804,35 @@ fn resume_for(state: Option<&PlaybackState>, ours: &str) -> Option<Resume> {
 /// its own corpse as somebody else's playback and politely declined. The
 /// id being replaced is stale by definition, and the new id is where we
 /// are trying to arrive; neither is a reason to stand aside.
+/// What to tell someone whose Connect device will not register.
+///
+/// This string is shown across the player while it lasts, so it has to
+/// read like a sentence about their music rather than a rendering of
+/// somebody else's error type: librespot's reaches the log as
+/// `Service unavailable { client error (Connect) }`, which says nothing
+/// to the person whose music just stopped. The full error stays in the
+/// log, where there is room for it.
+///
+/// Phrased as something in progress because it is: the supervisor keeps
+/// retrying with backoff for as long as the daemon runs. A reason that
+/// sounds final would be the wrong thing to leave on screen.
+#[cfg(feature = "streaming")]
+fn no_device_reason(e: &anyhow::Error) -> String {
+    let text = format!("{e:#}").to_lowercase();
+    // Matched on text because these arrive as librespot's own error
+    // types through anyhow, with no variant left to match on. Wrong
+    // guesses fall through to the general wording, which is still true.
+    let unreachable =
+        ["service unavailable", "error sending request", "resolve", "dns", "os error"]
+            .iter()
+            .any(|needle| text.contains(needle));
+    if unreachable {
+        "cannot reach Spotify; reconnecting".into()
+    } else {
+        "no Connect device yet; retrying".into()
+    }
+}
+
 #[cfg(feature = "streaming")]
 fn taken_by_someone_else(active: Option<&str>, ours: &str, previous: Option<&str>) -> bool {
     match active {
@@ -980,11 +1009,15 @@ async fn supervise_streaming(
             }
             Err(e) => {
                 *daemon.streaming_state.write().await =
-                    StreamingState::Unavailable(format!("{e:#}"));
+                    StreamingState::Unavailable(no_device_reason(&e));
                 // Once at startup, then quietly: a machine with no audio
                 // output would otherwise put the same line in the log every
                 // minute for as long as the daemon runs.
                 if first {
+                    // To the log as well as the terminal: the player only
+                    // has room for the short reason above, so this is the
+                    // one place the actual error is written down.
+                    tracing::warn!("no Connect device: {e:#}");
                     eprintln!("boombox: no Connect device: {e:#}");
                     eprintln!(
                         "boombox: everything else works; `boombox daemon --status` says more"
@@ -2768,6 +2801,32 @@ mod tests {
         assert_eq!(wrote(&Request::Next), Some(Wrote::Track));
         assert_eq!(wrote(&Request::PlaybackState), None);
         assert_eq!(wrote(&Request::Devices), None);
+    }
+
+    /// The reason goes across the player, so it has to read as a
+    /// sentence rather than as a rendering of librespot's error type.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn an_unreachable_spotify_is_said_in_words() {
+        // The literal librespot produces, braces and all.
+        let raw = anyhow::Error::msg("Service unavailable { client error (Connect) }")
+            .context("could not register as a Connect device");
+        let said = no_device_reason(&raw);
+
+        assert_eq!(said, "cannot reach Spotify; reconnecting");
+        assert!(!said.contains('{'), "no debug braces reach the screen: {said}");
+        assert!(!said.contains("Connect device"), "nor the internal wording: {said}");
+    }
+
+    /// Anything unrecognised still has to read as something in progress,
+    /// because the supervisor really is still retrying.
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn an_unrecognised_failure_still_reads_as_in_progress() {
+        let raw = anyhow::anyhow!("this build has no audio backend compiled in");
+        let said = no_device_reason(&raw);
+
+        assert_eq!(said, "no Connect device yet; retrying");
     }
 
     /// A transfer that starts playing is the ordinary case, and the one
