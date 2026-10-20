@@ -57,6 +57,10 @@ pub async fn run(direct: bool) -> Result<()> {
                 startup = ?startup,
                 "tui: using the daemon"
             );
+            let ipc = match crate::daemon::reviver(&config) {
+                Some(revive) => ipc.with_revive(revive),
+                None => ipc,
+            };
             return boombox_tui::run(
                 Arc::new(ipc),
                 boombox_tui::Options {

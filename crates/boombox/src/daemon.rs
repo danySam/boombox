@@ -430,12 +430,36 @@ struct Cooldown {
 
 /// Removes the socket file on the way out, including on a panic. A leftover
 /// file makes the next start look like a daemon is already running.
-struct SocketGuard(PathBuf);
+///
+/// Only if the file is still the one this daemon bound. Shutting down takes
+/// a moment, and a client that finds the listener gone starts a replacement
+/// in the meantime; removing the path then would delete the replacement's
+/// socket, leaving it running and unreachable while yet another is started.
+struct SocketGuard {
+    path: PathBuf,
+    bound: Option<(u64, u64)>,
+}
+
+impl SocketGuard {
+    fn new(path: PathBuf) -> Self {
+        let bound = file_identity(&path);
+        Self { path, bound }
+    }
+}
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if self.bound.is_some() && file_identity(&self.path) == self.bound {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+/// Device and inode: what distinguishes our socket from a later one at
+/// the same path.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
 pub async fn run(config: &Config) -> Result<()> {
@@ -461,7 +485,7 @@ pub async fn run(config: &Config) -> Result<()> {
 
     let listener =
         UnixListener::bind(&path).with_context(|| format!("cannot bind {}", path.display()))?;
-    let _guard = SocketGuard(path.clone());
+    let _guard = SocketGuard::new(path.clone());
     // Private to its owner. It normally sits in the state directory, which is
     // private already, but the path is configurable -- and the advice for an
     // over-long one is to move it to /tmp.
@@ -2503,6 +2527,24 @@ pub async fn ensure_running(config: &Config) -> (Option<IpcClient>, Startup) {
     }
 }
 
+/// How a long-lived client brings back a daemon that died under it, or
+/// `None` when autostart is off and it should stay dead.
+pub fn reviver(config: &Config) -> Option<boombox_ipc::Revive> {
+    if !config.daemon.autostart {
+        return None;
+    }
+    let path = config.socket_path().ok()?;
+    Some(Arc::new(move || {
+        let path = path.clone();
+        Box::pin(async move {
+            start_and_wait(&path)
+                .await
+                .map(drop)
+                .map_err(|e| std::io::Error::other(e.to_string()).into())
+        })
+    }))
+}
+
 async fn start_and_wait(path: &Path) -> Result<IpcClient> {
     spawn_detached()?;
 
@@ -2573,6 +2615,38 @@ pub async fn daemon_status(config: &Config) -> Option<DaemonStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn guard_socket(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("boombox-guard-{}-{name}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn the_socket_guard_removes_its_own_socket() {
+        let path = guard_socket("own");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(SocketGuard::new(path.clone()));
+        assert!(!path.exists());
+    }
+
+    /// A replacement started while this daemon was shutting down has bound
+    /// a new socket at the same path. Removing it would strand that daemon.
+    #[test]
+    fn the_socket_guard_leaves_a_successors_socket_alone() {
+        let path = guard_socket("successor");
+        let ours = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let guard = SocketGuard::new(path.clone());
+
+        std::fs::remove_file(&path).unwrap();
+        drop(ours);
+        let _theirs = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+        drop(guard);
+        assert!(path.exists(), "the successor's socket was deleted");
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// A daemon with no Spotify behind it. Enough to exercise the request
     /// Both halves are required, and the missing one has to be named: this

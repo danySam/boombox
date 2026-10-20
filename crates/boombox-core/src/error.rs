@@ -77,6 +77,10 @@ pub enum Error {
     )]
     DaemonNotAnswering(u64),
 
+    /// The daemon went away and a new one could not be started.
+    #[error("the boombox daemon stopped and could not be started again: {0}")]
+    DaemonGone(String),
+
     #[error("config error: {0}")]
     Config(String),
 

@@ -7,7 +7,10 @@
 
 pub mod protocol;
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use boombox_core::api::library::{LibraryApi, RecentsApi};
@@ -24,10 +27,18 @@ use tokio::net::UnixStream;
 
 pub use protocol::{DaemonStatus, Request, Response, StreamingState, WireError, WireErrorKind};
 
+/// Starts a daemon and returns once it answers. Supplied by the binary,
+/// which is the only crate that knows how to launch one.
+pub type Revive = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
+
 /// Talks to a running daemon. Implements [`PlayerApi`], so the front ends
 /// cannot tell whether they are speaking to the daemon or to Spotify.
 pub struct IpcClient {
     path: PathBuf,
+    revive: Option<Revive>,
+    /// Held while a daemon is being started, so a burst of polls that all
+    /// find the socket gone starts one daemon rather than one each.
+    reviving: tokio::sync::Mutex<()>,
 }
 
 impl IpcClient {
@@ -40,11 +51,43 @@ impl IpcClient {
             tracing::debug!("no daemon at {}: {e}", path.display());
             Error::Io(e)
         })?;
-        Ok(Self { path: path.to_path_buf() })
+        Ok(Self { path: path.to_path_buf(), revive: None, reviving: tokio::sync::Mutex::new(()) })
+    }
+
+    /// Starts a new daemon, via `revive`, when this one has gone away.
+    ///
+    /// Without it a client outlives its daemon uselessly: the socket file
+    /// goes with the process, and every request after that fails with a
+    /// bare "No such file or directory".
+    #[must_use]
+    pub fn with_revive(mut self, revive: Revive) -> Self {
+        self.revive = Some(revive);
+        self
     }
 
     pub async fn request(&self, request: Request) -> Result<Response> {
-        exchange(&self.path, request).await
+        let revive = match (&self.revive, &request) {
+            // Asking a daemon to stop is no reason to start one.
+            (_, Request::Shutdown) | (None, _) => return exchange(&self.path, request).await,
+            (Some(revive), _) => revive,
+        };
+        match exchange(&self.path, request.clone()).await {
+            Err(Error::Io(e)) if gone(&e) => {
+                self.revive(revive).await?;
+                exchange(&self.path, request).await
+            }
+            other => other,
+        }
+    }
+
+    async fn revive(&self, revive: &Revive) -> Result<()> {
+        let _held = self.reviving.lock().await;
+        // Another request may have started one while this one waited.
+        if UnixStream::connect(&self.path).await.is_ok() {
+            return Ok(());
+        }
+        tracing::info!("the daemon has gone; starting another");
+        revive().await.map_err(|e| Error::DaemonGone(e.to_string()))
     }
 
     /// Round-trips a request on a fresh connection to `path`.
@@ -59,6 +102,12 @@ impl IpcClient {
             other => Err(unexpected(&other)),
         }
     }
+}
+
+/// No daemon behind the socket: the file is missing, or nothing listens on
+/// it any more. A daemon that is merely slow is a timeout, not this.
+fn gone(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)
 }
 
 /// One request on a fresh connection, bounded by that request's timeout.
@@ -404,5 +453,66 @@ mod tests {
             exchange_within(&path, Request::Pause, Duration::from_millis(100)).await.unwrap_err();
         assert!(matches!(err, Error::DaemonNotAnswering(_)), "{err}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Answers every request with `Unit`, for as long as the test runs.
+    fn reply_always(listener: UnixListener) {
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut line = String::new();
+                    let _ = BufReader::new(read).read_line(&mut line).await;
+                    let _ = write.write_all(b"{\"reply\":\"unit\"}\n").await;
+                });
+            }
+        });
+    }
+
+    /// A client whose daemon has vanished, and a count of daemons started.
+    fn orphan(name: &str) -> (IpcClient, Arc<std::sync::atomic::AtomicU32>) {
+        let path = socket(name);
+        let started = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let revive: Revive = {
+            let (path, started) = (path.clone(), Arc::clone(&started));
+            Arc::new(move || {
+                let (path, started) = (path.clone(), Arc::clone(&started));
+                Box::pin(async move {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    reply_always(UnixListener::bind(&path)?);
+                    Ok(())
+                })
+            })
+        };
+        let client = IpcClient { path, revive: None, reviving: tokio::sync::Mutex::new(()) }
+            .with_revive(revive);
+        (client, started)
+    }
+
+    /// The TUI polls several things at once, so a dead daemon is found by
+    /// a burst of requests together. One replacement, not one each.
+    #[tokio::test]
+    async fn a_vanished_daemon_is_started_again_once() {
+        let (client, started) = orphan("revive");
+
+        let (a, b, c) = tokio::join!(
+            client.request(Request::Pause),
+            client.request(Request::PlaybackState),
+            client.request(Request::Ping),
+        );
+        for response in [a, b, c] {
+            assert!(matches!(response, Ok(Response::Unit)), "{response:?}");
+        }
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(&client.path);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_vanished_daemon_does_not_start_one() {
+        let (client, started) = orphan("no-revive");
+
+        let err = client.request(Request::Shutdown).await.unwrap_err();
+        assert!(matches!(&err, Error::Io(e) if gone(e)), "{err}");
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
