@@ -25,6 +25,15 @@ const MAX_BACKOFF: Duration = Duration::from_secs(120);
 /// anything inside half a minute means somebody is looking.
 const ATTENDED_WINDOW: Duration = Duration::from_secs(30);
 
+/// How long after a change to playback the poller keeps its playing pace,
+/// whatever it last saw.
+///
+/// Spotify takes a second or so to report a change it has accepted. The
+/// poll a change triggers usually lands inside that, still sees nothing
+/// playing, and used to drop to the idle interval -- so the music started
+/// and the player said otherwise for up to fifteen seconds.
+const AFTER_CHANGE: Duration = Duration::from_secs(5);
+
 /// How much further silence halves the request rate again.
 const UNATTENDED_STEP: Duration = Duration::from_secs(60);
 
@@ -419,6 +428,10 @@ struct Stats {
     /// change in this one means a newer intention than whatever recovery
     /// is in the middle of restoring.
     playback_commands: AtomicU64,
+    /// Milliseconds since the daemon started, at the last accepted change
+    /// to playback -- a client's command or the daemon's own transfer.
+    /// Zero means none yet.
+    last_change_millis: AtomicU64,
 }
 
 /// A pause Spotify asked for, and why.
@@ -1218,6 +1231,23 @@ impl Daemon {
     /// A daemon that has never been asked reads as "since startup", which
     /// is the answer that matters: one started automatically and then left
     /// alone is the case worth backing off from.
+    /// Playback has just changed: look now, and keep looking briskly until
+    /// Spotify's answer catches up. See [`AFTER_CHANGE`].
+    fn changed(&self) {
+        // At least 1, so a change in the daemon's first millisecond is not
+        // read as no change at all.
+        let now = (self.started.elapsed().as_millis() as u64).max(1);
+        self.stats.last_change_millis.store(now, Ordering::Relaxed);
+        self.nudge.notify_one();
+    }
+
+    fn just_changed(&self) -> bool {
+        match self.stats.last_change_millis.load(Ordering::Relaxed) {
+            0 => false,
+            at => self.started.elapsed().saturating_sub(Duration::from_millis(at)) < AFTER_CHANGE,
+        }
+    }
+
     fn since_last_request(&self) -> Duration {
         let last = Duration::from_millis(self.stats.last_request_millis.load(Ordering::Relaxed));
         self.started.elapsed().saturating_sub(last)
@@ -1306,6 +1336,8 @@ impl Daemon {
                     next
                 }
             };
+            let interval =
+                if self.just_changed() { interval.min(self.active_interval) } else { interval };
             // Leaving a cooldown gently. Whatever allowance comes back is
             // shared and small, and going straight back to a poll a second
             // is the quickest way into the next restriction -- so for a
@@ -1520,6 +1552,7 @@ impl Daemon {
                 // must not be shown as though it had worked.
                 if let Some(what) = recorded {
                     self.remember(what).await;
+                    self.changed();
                 }
                 response
             }
@@ -1992,7 +2025,10 @@ impl Daemon {
                 && let Some(id) = device.id.as_deref()
             {
                 return match self.client.transfer(id, play).await {
-                    Ok(()) => Took::Yes,
+                    Ok(()) => {
+                        self.changed();
+                        Took::Yes
+                    }
                     Err(e) => Took::Failed(format!("{e}")),
                 };
             }
@@ -2621,6 +2657,16 @@ mod tests {
             std::env::temp_dir().join(format!("boombox-guard-{}-{name}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    /// What keeps the poller at its playing pace while Spotify catches up
+    /// with a change, rather than dropping to idle on the first stale answer.
+    #[test]
+    fn a_change_to_playback_holds_the_brisk_pace() {
+        let daemon = offline_daemon();
+        assert!(!daemon.just_changed(), "nothing has changed yet");
+        daemon.changed();
+        assert!(daemon.just_changed());
     }
 
     #[test]
