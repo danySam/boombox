@@ -24,7 +24,7 @@ use librespot::playback::config::{AudioFormat, Bitrate, PlayerConfig};
 use librespot::playback::convert::Converter;
 use librespot::playback::decoder::AudioPacket;
 use librespot::playback::mixer::{self, MixerConfig};
-use librespot::playback::player::Player;
+use librespot::playback::player::{Player, PlayerEvent};
 use librespot::playback::{NUM_CHANNELS, SAMPLE_RATE};
 
 use crate::spectrum::SpectrumTap;
@@ -175,11 +175,73 @@ impl Sink for TappedSink {
 /// A running Connect device. Dropping this does not stop it; call
 /// [`Streaming::shutdown`] so librespot deregisters cleanly and Spotify does
 /// not leave a ghost device in the picker.
+/// What the local player last said it was doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Local {
+    /// Nothing loaded, or playback has moved to another device.
+    Stopped,
+    Playing,
+    Paused,
+}
+
+/// The Connect player this process runs, and what it says it is doing.
+///
+/// A command to librespot is only a request. It is queued and accepted
+/// whatever happens to it, and librespot drops pause and play outright
+/// while its Connect state is not active -- which it can be while Spotify
+/// still lists this device as the one playing, after a transfer it could
+/// not complete. So a command counts as done only once the player reports
+/// the state it asked for.
+pub struct LocalPlayer {
+    spirc: Arc<Spirc>,
+    state: tokio::sync::watch::Receiver<Local>,
+}
+
+impl LocalPlayer {
+    /// Asks the player to play or pause, and says whether it did within
+    /// `within`. `Err` means the command could not even be queued.
+    pub async fn set_playing(
+        &self,
+        playing: bool,
+        within: Duration,
+    ) -> Result<bool, librespot::core::Error> {
+        let mut state = self.state.clone();
+        state.mark_unchanged();
+        if playing { self.spirc.play() } else { self.spirc.pause() }?;
+        Ok(reached(state, if playing { Local::Playing } else { Local::Paused }, within).await)
+    }
+
+    /// Asks the player to start, without waiting to hear back. For callers
+    /// with a better witness of their own, such as audio reaching the sink.
+    pub fn play(&self) -> Result<(), librespot::core::Error> {
+        self.spirc.play()
+    }
+}
+
+/// Whether `state` is, or becomes, `want` within `within`.
+async fn reached(
+    mut state: tokio::sync::watch::Receiver<Local>,
+    want: Local,
+    within: Duration,
+) -> bool {
+    matches!(tokio::time::timeout(within, state.wait_for(|s| *s == want)).await, Ok(Ok(_)))
+}
+
+/// The player state a librespot event reports, if it reports one.
+fn local_state(event: &PlayerEvent) -> Option<Local> {
+    match event {
+        PlayerEvent::Playing { .. } => Some(Local::Playing),
+        PlayerEvent::Paused { .. } => Some(Local::Paused),
+        PlayerEvent::Stopped { .. } => Some(Local::Stopped),
+        _ => None,
+    }
+}
+
 pub struct Streaming {
     /// Behind an `Arc` so the daemon can hold the same handle: pausing the
     /// player this process is running needs no Spotify round trip, which is
     /// the one control path that still works when the Web API will not.
-    spirc: Arc<Spirc>,
+    player: Arc<LocalPlayer>,
     device_name: String,
     device_id: String,
     tap: Arc<SpectrumTap>,
@@ -208,8 +270,8 @@ impl Streaming {
     /// Shared handle to the Connect player, for the controls that need no
     /// Web API call: this process owns the audio, so pausing it is a local
     /// matter whatever Spotify's rate limiter happens to be doing.
-    pub fn spirc(&self) -> Arc<Spirc> {
-        Arc::clone(&self.spirc)
+    pub fn player(&self) -> Arc<LocalPlayer> {
+        Arc::clone(&self.player)
     }
 
     /// Shared handle to the audio tap, so the daemon can serve spectrum
@@ -219,7 +281,7 @@ impl Streaming {
     }
 
     pub fn shutdown(&self) {
-        if let Err(e) = self.spirc.shutdown() {
+        if let Err(e) = self.player.spirc.shutdown() {
             tracing::warn!("librespot shutdown failed: {e}");
         }
     }
@@ -331,6 +393,18 @@ pub async fn start(config: &Config) -> Result<Streaming> {
         Box::new(TappedSink { inner: backend(None, AudioFormat::default()), tap: sink_tap })
     });
 
+    // Subscribed before Spirc takes the player, so no event is missed.
+    let mut events = player.get_player_event_channel();
+    let (state_tx, state) = tokio::sync::watch::channel(Local::Stopped);
+    tokio::spawn(async move {
+        // Ends when the player does, which drops the sender.
+        while let Some(event) = events.recv().await {
+            if let Some(local) = local_state(&event) {
+                state_tx.send_replace(local);
+            }
+        }
+    });
+
     let name = device_name(config);
     let connect_config = ConnectConfig {
         name: name.clone(),
@@ -351,7 +425,7 @@ pub async fn start(config: &Config) -> Result<Streaming> {
     let task = tokio::spawn(spirc_task);
 
     Ok(Streaming {
-        spirc: Arc::new(spirc),
+        player: Arc::new(LocalPlayer { spirc: Arc::new(spirc), state }),
         device_name: name,
         device_id,
         tap,
@@ -363,6 +437,40 @@ pub async fn start(config: &Config) -> Result<Streaming> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_state_the_player_reports_in_time_counts() {
+        let (tx, rx) = tokio::sync::watch::channel(Local::Paused);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.send_replace(Local::Playing);
+            // Held, so the wait ends on the state rather than the sender.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        assert!(reached(rx, Local::Playing, Duration::from_secs(2)).await);
+    }
+
+    /// The case this exists for: librespot accepted the command, dropped
+    /// it, and the player never moved.
+    #[tokio::test]
+    async fn a_command_the_player_ignores_is_not_counted() {
+        let (_tx, rx) = tokio::sync::watch::channel(Local::Paused);
+        assert!(!reached(rx, Local::Playing, Duration::from_millis(100)).await);
+    }
+
+    /// Pausing what is already paused changes nothing, and is done.
+    #[tokio::test]
+    async fn already_being_there_counts() {
+        let (_tx, rx) = tokio::sync::watch::channel(Local::Paused);
+        assert!(reached(rx, Local::Paused, Duration::from_millis(100)).await);
+    }
+
+    #[tokio::test]
+    async fn a_player_that_has_gone_does_not_count() {
+        let (tx, rx) = tokio::sync::watch::channel(Local::Paused);
+        drop(tx);
+        assert!(!reached(rx, Local::Playing, Duration::from_secs(2)).await);
+    }
 
     /// The whole point: a session whose connection has gone must be
     /// noticed promptly, not when the protocol task eventually gives up.

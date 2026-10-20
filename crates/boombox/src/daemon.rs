@@ -34,6 +34,11 @@ const ATTENDED_WINDOW: Duration = Duration::from_secs(30);
 /// and the player said otherwise for up to fifteen seconds.
 const AFTER_CHANGE: Duration = Duration::from_secs(5);
 
+/// How long the local player gets to report that it paused or resumed.
+/// It answers in milliseconds when it acts at all.
+#[cfg(feature = "streaming")]
+const LOCAL_ANSWER: Duration = Duration::from_secs(1);
+
 /// How much further silence halves the request rate again.
 const UNATTENDED_STEP: Duration = Duration::from_secs(60);
 
@@ -128,7 +133,7 @@ pub struct Daemon {
     /// out of this very machine, leaving killing the daemon as the only
     /// way to get silence.
     #[cfg(feature = "streaming")]
-    spirc: Arc<RwLock<Option<Arc<librespot::connect::Spirc>>>>,
+    player: Arc<RwLock<Option<Arc<crate::streaming::LocalPlayer>>>>,
     /// Whether a Connect device is registered right now, and if not, why.
     /// The daemon can be perfectly healthy while there is none.
     streaming_state: Arc<RwLock<StreamingState>>,
@@ -515,7 +520,7 @@ pub async fn run(config: &Config) -> Result<()> {
         #[cfg(feature = "streaming")]
         spectrum: Arc::new(RwLock::new(None)),
         #[cfg(feature = "streaming")]
-        spirc: Arc::new(RwLock::new(None)),
+        player: Arc::new(RwLock::new(None)),
         streaming_state: Arc::new(RwLock::new(initial_streaming_state())),
         #[cfg(feature = "streaming")]
         envelope: Arc::new(RwLock::new(crate::spectrum::Envelope::new(ENVELOPE_BUCKETS))),
@@ -1034,7 +1039,7 @@ async fn supervise_streaming(
                     );
                 }
                 *daemon.spectrum.write().await = Some(handle.tap());
-                *daemon.spirc.write().await = Some(handle.spirc());
+                *daemon.player.write().await = Some(handle.player());
                 *daemon.device_id.write().await = Some(handle.device_id().to_string());
                 // Not live yet: librespot being connected is not the same
                 // as Spotify listing the device, and only the second makes
@@ -1134,7 +1139,7 @@ async fn supervise_streaming(
                         *daemon.spectrum.write().await = None;
                         // A player whose session has died cannot be driven,
                         // and the replacement brings its own handle.
-                        *daemon.spirc.write().await = None;
+                        *daemon.player.write().await = None;
                         // The next session registers a new id, and until it
                         // does we have no device: an id left behind here
                         // would be another machine's to match.
@@ -1152,7 +1157,7 @@ async fn supervise_streaming(
                         );
                         handle.shutdown();
                         *daemon.spectrum.write().await = None;
-                        *daemon.spirc.write().await = None;
+                        *daemon.player.write().await = None;
                         *daemon.device_id.write().await = None;
                         *daemon.streaming_state.write().await =
                             StreamingState::Unavailable(REGISTERING.into());
@@ -1160,7 +1165,7 @@ async fn supervise_streaming(
                     Registered::Shutdown => {
                         handle.shutdown();
                         *daemon.streaming_state.write().await = StreamingState::Disabled;
-                        *daemon.spirc.write().await = None;
+                        *daemon.player.write().await = None;
                         *daemon.device_id.write().await = None;
                         return;
                     }
@@ -1625,11 +1630,20 @@ impl Daemon {
         if !self.playback_is_ours().await {
             return None;
         }
-        let spirc = self.spirc.read().await.clone()?;
-        Some(match if resume { spirc.play() } else { spirc.pause() } {
-            Ok(()) => {
+        let player = self.player.read().await.clone()?;
+        Some(match player.set_playing(resume, LOCAL_ANSWER).await {
+            Ok(true) => {
                 tracing::debug!(resume, "answered by the local player, without asking Spotify");
                 Ok(Response::Unit)
+            }
+            // Spotify thinks this device is playing and librespot does not
+            // agree, so it dropped the command. Saying it worked would
+            // leave the button doing nothing; the Web API may yet reach a
+            // device librespot will not, and during a rate limit the
+            // refusal that follows is at least the truth.
+            Ok(false) => {
+                tracing::warn!(resume, "the local player did not respond; asking Spotify instead");
+                return None;
             }
             // Not retried through the Web API. A local player that refuses
             // is a player whose session is going, and spending a request to
@@ -1961,10 +1975,10 @@ impl Daemon {
             if nudge == RESUME_NUDGES {
                 break;
             }
-            let Some(spirc) = self.spirc.read().await.clone() else {
+            let Some(player) = self.player.read().await.clone() else {
                 return Settled::Unverifiable;
             };
-            if let Err(e) = spirc.play() {
+            if let Err(e) = player.play() {
                 // A local player that refuses is a player whose session is
                 // going. Asking it twice more would only say so twice more.
                 tracing::debug!("the local player would not start: {e}");
@@ -3262,7 +3276,7 @@ mod tests {
             #[cfg(feature = "streaming")]
             spectrum: Arc::new(RwLock::new(None)),
             #[cfg(feature = "streaming")]
-            spirc: Arc::new(RwLock::new(None)),
+            player: Arc::new(RwLock::new(None)),
             streaming_state: Arc::new(RwLock::new(initial_streaming_state())),
             #[cfg(feature = "streaming")]
             envelope: Arc::new(RwLock::new(crate::spectrum::Envelope::new(ENVELOPE_BUCKETS))),
