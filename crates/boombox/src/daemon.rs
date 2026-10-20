@@ -446,30 +446,37 @@ struct Cooldown {
     reason: Option<String>,
 }
 
-/// Removes the socket file on the way out, including on a panic. A leftover
-/// file makes the next start look like a daemon is already running.
+/// The listening socket, and the file it is bound to.
 ///
-/// Only if the file is still the one this daemon bound. Shutting down takes
-/// a moment, and a client that finds the listener gone starts a replacement
-/// in the meantime; removing the path then would delete the replacement's
-/// socket, leaving it running and unreachable while yet another is started.
-struct SocketGuard {
+/// Dropping it removes the file first and closes the listener after, so
+/// the file is never there without something listening on it. That order
+/// is the point. A client that finds the socket gone starts a replacement,
+/// and if the listener closed first, the replacement could bind the path
+/// before this daemon removed it -- deleting the replacement's socket and
+/// leaving it running and unreachable while yet another was started.
+/// Removed on a panic too: a leftover file makes the next start look like
+/// a daemon is already running.
+struct SocketGuard<L> {
     path: PathBuf,
     bound: Option<(u64, u64)>,
+    listener: L,
 }
 
-impl SocketGuard {
-    fn new(path: PathBuf) -> Self {
+impl<L> SocketGuard<L> {
+    fn new(path: PathBuf, listener: L) -> Self {
         let bound = file_identity(&path);
-        Self { path, bound }
+        Self { path, bound, listener }
     }
 }
 
-impl Drop for SocketGuard {
+impl<L> Drop for SocketGuard<L> {
     fn drop(&mut self) {
+        // Still checked, for a file somebody replaced by hand. While the
+        // listener is open its inode cannot be reused, so a match is ours.
         if self.bound.is_some() && file_identity(&self.path) == self.bound {
             let _ = std::fs::remove_file(&self.path);
         }
+        // `listener` closes after this returns, once the file is gone.
     }
 }
 
@@ -501,9 +508,10 @@ pub async fn run(config: &Config) -> Result<()> {
     let auth = Arc::new(boombox_core::Auth::from_config(config)?);
     let client = Arc::new(Client::new(Arc::clone(&auth)));
 
-    let listener =
-        UnixListener::bind(&path).with_context(|| format!("cannot bind {}", path.display()))?;
-    let _guard = SocketGuard::new(path.clone());
+    let listener = SocketGuard::new(
+        path.clone(),
+        UnixListener::bind(&path).with_context(|| format!("cannot bind {}", path.display()))?,
+    );
     // Private to its owner. It normally sits in the state directory, which is
     // private already, but the path is configurable -- and the advice for an
     // over-long one is to move it to /tmp.
@@ -548,7 +556,7 @@ pub async fn run(config: &Config) -> Result<()> {
         async move {
             loop {
                 tokio::select! {
-                    accepted = listener.accept() => {
+                    accepted = listener.listener.accept() => {
                         match accepted {
                             Ok((stream, _)) => {
                                 let daemon = Arc::clone(&daemon);
@@ -2686,25 +2694,24 @@ mod tests {
     #[test]
     fn the_socket_guard_removes_its_own_socket() {
         let path = guard_socket("own");
-        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        drop(SocketGuard::new(path.clone()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(SocketGuard::new(path.clone(), listener));
         assert!(!path.exists());
     }
 
-    /// A replacement started while this daemon was shutting down has bound
-    /// a new socket at the same path. Removing it would strand that daemon.
+    /// Somebody else's socket now sits at the path: removing it would strand
+    /// whatever is listening there.
     #[test]
-    fn the_socket_guard_leaves_a_successors_socket_alone() {
-        let path = guard_socket("successor");
+    fn the_socket_guard_leaves_a_replaced_socket_alone() {
+        let path = guard_socket("replaced");
         let ours = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let guard = SocketGuard::new(path.clone());
+        let guard = SocketGuard::new(path.clone(), ours);
 
         std::fs::remove_file(&path).unwrap();
-        drop(ours);
         let _theirs = std::os::unix::net::UnixListener::bind(&path).unwrap();
 
         drop(guard);
-        assert!(path.exists(), "the successor's socket was deleted");
+        assert!(path.exists(), "the other socket was deleted");
         let _ = std::fs::remove_file(&path);
     }
 
