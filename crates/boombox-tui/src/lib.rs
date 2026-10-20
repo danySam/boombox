@@ -41,11 +41,10 @@ enum Message {
         append: bool,
     },
     Spectrum(Vec<f32>),
-    /// Why the daemon has no Connect session, or `None` once it has one
-    /// again. Sent on every health tick rather than only on a change, so
-    /// a TUI that starts during an outage is not left waiting for the
-    /// edge it already missed.
-    Streaming(Option<String>),
+    /// How the daemon's Connect device is doing. Sent on every health
+    /// tick rather than only on a change, so a TUI that starts during an
+    /// outage is not left waiting for the edge it already missed.
+    Connect(boombox_core::api::ConnectHealth),
     /// A palette read from artwork, with the cover it came from so the
     /// result can be remembered. `None` means the cover had no usable colour.
     Artwork {
@@ -268,7 +267,7 @@ where
                     app.accept_entries(&view, &query, entries, total, append)
                 }
                 Message::Spectrum(bands) => app.set_spectrum(bands),
-                Message::Streaming(outage) => app.set_streaming_outage(outage),
+                Message::Connect(health) => app.set_connect_health(health),
                 Message::Artwork { url, artwork } => {
                     // Only apply it if it is still the cover we are on: a
                     // slow fetch for the previous track must not repaint
@@ -502,8 +501,8 @@ where
             // A failed ask is not an outage: the daemon may be busy or
             // going away, and painting "connection lost" over a daemon
             // that is merely slow to answer would be its own lie.
-            if let Ok(outage) = api.streaming_outage().await
-                && tx.send(Message::Streaming(outage)).is_err()
+            if let Ok(health) = api.connect_health().await
+                && tx.send(Message::Connect(health)).is_err()
             {
                 return;
             }

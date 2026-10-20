@@ -694,6 +694,23 @@ const RECONNECT_MAX: Duration = Duration::from_secs(60);
 #[cfg(feature = "streaming")]
 const RECONNECT_UNREACHABLE: Duration = Duration::from_secs(3);
 
+/// What the player says between librespot connecting and Spotify listing
+/// the device -- the stretch in which the device exists for us and not yet
+/// for anyone choosing where to play.
+#[cfg(feature = "streaming")]
+const REGISTERING: &str = "registering this device with Spotify";
+/// How long a new session's device has to appear in Spotify's device list
+/// before the session is dropped and registered again. A session can come
+/// up on our side and never be listed on theirs; left alone, that is a
+/// device the daemon calls live and nobody can pick, for as long as the
+/// daemon runs.
+#[cfg(feature = "streaming")]
+const LIST_WAIT: Duration = Duration::from_secs(15);
+/// How often the device list is read while waiting. Each read is a Web API
+/// request, so this is the most it costs: eight of them per registration.
+#[cfg(feature = "streaming")]
+const LIST_POLL: Duration = Duration::from_secs(2);
+
 /// Keeps a Connect device registered for as long as the daemon runs.
 ///
 /// librespot's protocol task ending *is* the notification that the session
@@ -864,6 +881,19 @@ fn is_unreachable(e: &anyhow::Error) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+/// How far a new Connect session got.
+#[cfg(feature = "streaming")]
+enum Registered {
+    /// Spotify lists the device; it can be picked.
+    Listed,
+    /// Connected on our side, never listed on theirs within [`LIST_WAIT`].
+    Unlisted,
+    /// The session ended, listed or not.
+    Ended(crate::streaming::Ended),
+    /// The daemon is going away.
+    Shutdown,
+}
+
 #[cfg(feature = "streaming")]
 fn taken_by_someone_else(active: Option<&str>, ours: &str, previous: Option<&str>) -> bool {
     match active {
@@ -949,6 +979,10 @@ async fn supervise_streaming(
     // active device at all, so without this the music stops and waits to
     // be told where to go.
     let mut resume: Option<Resume> = None;
+    // Said from the start: until the first session is listed there is no
+    // device to pick, and the state left over from startup reads as
+    // streaming being switched off.
+    *daemon.streaming_state.write().await = StreamingState::Unavailable(REGISTERING.into());
     loop {
         match crate::streaming::start(config).await {
             Ok(mut handle) => {
@@ -965,31 +999,61 @@ async fn supervise_streaming(
                 *daemon.spectrum.write().await = Some(handle.tap());
                 *daemon.spirc.write().await = Some(handle.spirc());
                 *daemon.device_id.write().await = Some(handle.device_id().to_string());
-                *daemon.streaming_state.write().await = StreamingState::Live;
-                backoff = RECONNECT_FIRST;
+                // Not live yet: librespot being connected is not the same
+                // as Spotify listing the device, and only the second makes
+                // it something anyone can pick.
+                *daemon.streaming_state.write().await =
+                    StreamingState::Unavailable(REGISTERING.into());
+                let id = handle.device_id().to_string();
 
-                // Here rather than in the TUI: the daemon owns the device,
-                // so it knows the moment one exists to adopt. A front end
-                // can only guess and poll, and blocking a UI on that guess
-                // is what made the TUI slow to appear.
-                tokio::spawn({
-                    let daemon = Arc::clone(daemon);
-                    let id = handle.device_id().to_string();
-                    let name = handle.device_name().to_string();
-                    let adopt = config.daemon.adopt_playback;
-                    // Taken, so a session that later ends without us
-                    // holding playback does not restore a second time.
-                    let resume = resume.take();
-                    async move {
-                        match resume {
-                            Some(was) => daemon.resume_here(&was, &id, &name).await,
-                            None => daemon.adopt_if_idle(&id, &name, adopt).await,
+                let registered = tokio::select! {
+                    listed = daemon.wait_until_listed(&id) => {
+                        if listed { Registered::Listed } else { Registered::Unlisted }
+                    }
+                    reason = handle.ended() => Registered::Ended(reason),
+                    _ = shutdown.changed() => Registered::Shutdown,
+                };
+                let outcome = match registered {
+                    Registered::Listed => {
+                        *daemon.streaming_state.write().await = StreamingState::Live;
+                        // Reset only once listed. A session that comes up
+                        // and is never listed is a failure like any other,
+                        // and resetting on connect alone would retry it at
+                        // the shortest interval for ever.
+                        backoff = RECONNECT_FIRST;
+
+                        // Here rather than in the TUI: the daemon owns the
+                        // device, so it knows the moment one exists to
+                        // adopt. A front end can only guess and poll, and
+                        // blocking a UI on that guess is what made the TUI
+                        // slow to appear.
+                        tokio::spawn({
+                            let daemon = Arc::clone(daemon);
+                            let id = id.clone();
+                            let name = handle.device_name().to_string();
+                            let adopt = config.daemon.adopt_playback;
+                            // Taken, so a session that later ends without
+                            // us holding playback does not restore a
+                            // second time.
+                            let resume = resume.take();
+                            async move {
+                                match resume {
+                                    Some(was) => daemon.resume_here(&was, &id, &name).await,
+                                    None => daemon.adopt_if_idle(&id, &name, adopt).await,
+                                }
+                            }
+                        });
+
+                        tokio::select! {
+                            reason = handle.ended() => Registered::Ended(reason),
+                            _ = shutdown.changed() => Registered::Shutdown,
                         }
                     }
-                });
+                    other => other,
+                };
 
-                tokio::select! {
-                    reason = handle.ended() => {
+                match outcome {
+                    Registered::Ended(reason) => {
                         let why = match reason {
                             crate::streaming::Ended::ConnectionLost => {
                                 // Said plainly, because the symptom this
@@ -998,8 +1062,8 @@ async fn supervise_streaming(
                                 // anything but a lost connection.
                                 tracing::warn!(
                                     "the streaming connection dropped; \
-                                     restarting the session rather than \
-                                     playing on without it"
+                                         restarting the session rather than \
+                                         playing on without it"
                                 );
                                 "the connection dropped; reconnecting"
                             }
@@ -1013,10 +1077,16 @@ async fn supervise_streaming(
                         // what was true before the session died, and the
                         // account has no active device left to answer it
                         // with.
+                        //
+                        // A session that dies before it was ever listed
+                        // never held playback, so whatever the session
+                        // before it was carrying is kept rather than
+                        // replaced with nothing.
                         resume = {
                             let polled = daemon.cache.read().await;
                             resume_for(polled.playback.as_ref(), handle.device_id())
-                        };
+                        }
+                        .or(resume.take());
 
                         // Ends the player as well as the protocol task. A
                         // player left running against a dead session is
@@ -1033,13 +1103,31 @@ async fn supervise_streaming(
                         // would be another machine's to match.
                         *daemon.device_id.write().await = None;
                     }
-                    _ = shutdown.changed() => {
+                    Registered::Unlisted => {
+                        // Dropped rather than waited on: it is a fresh
+                        // session id that has reliably got a device
+                        // listed, and this one has had its chance. Any
+                        // playback still to restore stays carried for the
+                        // next session.
+                        tracing::warn!(
+                            device = %id,
+                            "Spotify never listed this device; registering again"
+                        );
+                        handle.shutdown();
+                        *daemon.spectrum.write().await = None;
+                        *daemon.spirc.write().await = None;
+                        *daemon.device_id.write().await = None;
+                        *daemon.streaming_state.write().await =
+                            StreamingState::Unavailable(REGISTERING.into());
+                    }
+                    Registered::Shutdown => {
                         handle.shutdown();
                         *daemon.streaming_state.write().await = StreamingState::Disabled;
                         *daemon.spirc.write().await = None;
                         *daemon.device_id.write().await = None;
                         return;
                     }
+                    Registered::Listed => unreachable!("a listed session ends or shuts down"),
                 }
             }
             Err(e) => {
@@ -1730,6 +1818,42 @@ impl Daemon {
                 was = %was.id, now = %device_id,
                 "reconnected as {device_name}, but playback was not restored: {other}"
             ),
+        }
+    }
+
+    /// Whether Spotify lists `device_id` within [`LIST_WAIT`].
+    ///
+    /// librespot connecting is not the same as the device being listed, and
+    /// a session can manage the first without ever getting the second. This
+    /// is what tells them apart.
+    ///
+    /// During a cooldown the list cannot be read, and re-registering would
+    /// not get it read any sooner, so the device is taken as listed rather
+    /// than torn down for something nobody could check.
+    #[cfg(feature = "streaming")]
+    async fn wait_until_listed(&self, device_id: &str) -> bool {
+        let deadline = Instant::now() + LIST_WAIT;
+        loop {
+            if self.cooldown_left().await.is_some() {
+                tracing::debug!("cannot read the device list during a cooldown; assuming listed");
+                return true;
+            }
+            match self.client.devices().await {
+                Ok(devices) if devices.iter().any(|d| d.id.as_deref() == Some(device_id)) => {
+                    return true;
+                }
+                Err(Error::RateLimited { retry_after_secs, reason }) => {
+                    let wait = retry_after_secs.map(Duration::from_secs).unwrap_or(UNSAID_COOLDOWN);
+                    self.begin_cooldown(wait, reason).await;
+                    return true;
+                }
+                // Not listed yet, or the network is still coming back.
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(LIST_POLL).await;
         }
     }
 

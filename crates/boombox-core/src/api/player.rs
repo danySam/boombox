@@ -35,6 +35,16 @@ pub trait PlayerApi: Send + Sync {
 /// Separate from [`PlayerApi`] because it is not a Spotify capability at all:
 /// it needs local access to the samples, which only the daemon has. The HTTP
 /// client implements it by returning nothing.
+/// What [`SpectrumApi::connect_health`] reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectHealth {
+    /// Why the device is not usable right now -- registering, reconnecting,
+    /// unreachable -- or `None` when it is listed and ready.
+    pub outage: Option<String>,
+    /// The id this machine's device is registered under at the moment.
+    pub device_id: Option<String>,
+}
+
 pub trait SpectrumApi: Send + Sync {
     /// `bands` magnitudes in 0.0..=1.0, low frequency first. An empty vector
     /// means no audio is being decoded here.
@@ -55,18 +65,19 @@ pub trait SpectrumApi: Send + Sync {
         async { Ok(None) }
     }
 
-    /// Why this machine has no Connect session at the moment, when it has
-    /// none: "the connection dropped; reconnecting" and the like. `None`
-    /// means the session is live, or that there was never one to lose.
+    /// How this machine's Connect device is doing: why it is not usable
+    /// yet, if it is not, and the id it is registered under.
     ///
     /// A front end polling a daemon over a local socket sees nothing of an
     /// outage otherwise -- playback keeps being answered from the cache,
-    /// which looks exactly like everything working.
+    /// which looks exactly like everything working. And the id changes
+    /// with every new session, so one read at startup goes stale on the
+    /// first reconnect.
     ///
     /// Only a daemon running the session can know, so the default is
     /// nothing, which is the honest answer from anywhere else.
-    fn streaming_outage(&self) -> impl Future<Output = Result<Option<String>>> + Send {
-        async { Ok(None) }
+    fn connect_health(&self) -> impl Future<Output = Result<ConnectHealth>> + Send {
+        async { Ok(ConnectHealth::default()) }
     }
 }
 

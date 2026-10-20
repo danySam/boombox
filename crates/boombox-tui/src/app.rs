@@ -1505,6 +1505,17 @@ impl App {
         }
     }
 
+    /// Takes the daemon's report on its Connect device.
+    ///
+    /// The id is replaced every time, not only when one arrives: every
+    /// session registers a fresh one, and between sessions there is no
+    /// device of ours to point at. Holding on to the last id would mark
+    /// a dead device as this machine in the picker.
+    pub fn set_connect_health(&mut self, health: boombox_core::api::ConnectHealth) {
+        self.set_streaming_outage(health.outage);
+        self.our_device_id = health.device_id;
+    }
+
     /// What to say about a missing Connect session, and for how long it
     /// has been missing. `None` when the session is fine.
     pub fn streaming_outage(&self) -> Option<(&str, Duration)> {
@@ -2390,6 +2401,36 @@ pub(crate) mod tests {
         let (_, second) = app.streaming_outage().expect("still showing");
 
         assert!(second > first, "the clock ran on: {first:?} then {second:?}");
+    }
+
+    /// Every session registers under a fresh id. An id read once at
+    /// startup would stop matching on the first reconnect, and the picker
+    /// would no longer know which device is this machine.
+    #[test]
+    fn our_device_follows_the_id_across_a_reconnect() {
+        use boombox_core::api::ConnectHealth;
+        let mut app = App::new(5, true);
+        app.set_connect_health(ConnectHealth { outage: None, device_id: Some("first".into()) });
+        assert_eq!(app.our_device_id.as_deref(), Some("first"));
+
+        // Between sessions there is no device of ours at all; keeping the
+        // old id would mark a dead device as this machine.
+        app.set_connect_health(ConnectHealth {
+            outage: Some("the connection dropped; reconnecting".into()),
+            device_id: None,
+        });
+        assert_eq!(app.our_device_id, None);
+
+        app.set_connect_health(ConnectHealth {
+            outage: Some("registering this device with Spotify".into()),
+            device_id: Some("second".into()),
+        });
+        assert_eq!(app.our_device_id.as_deref(), Some("second"));
+        let (why, _) = app.streaming_outage().expect("still not listed");
+        assert!(why.contains("registering"), "{why}");
+
+        app.set_connect_health(ConnectHealth { outage: None, device_id: Some("second".into()) });
+        assert!(app.streaming_outage().is_none(), "listed, so the line clears");
     }
 
     /// A different reason is a different outage, so that one starts its

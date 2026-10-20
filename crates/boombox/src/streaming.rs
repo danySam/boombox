@@ -236,8 +236,12 @@ impl Streaming {
     /// without decrypting it and feeds the decoder noise -- for ten
     /// minutes, in the case that prompted this, while the device went on
     /// advertising itself as healthy.
+    ///
+    /// Safe to stop waiting on and wait on again: the task is borrowed, not
+    /// taken, so a wait abandoned by a `select!` does not leave the next
+    /// one finding no task and reporting a live session as ended.
     pub async fn ended(&mut self) -> Ended {
-        let Some(task) = self.task.take() else {
+        let Some(task) = self.task.as_mut() else {
             return Ended::Task;
         };
         tokio::select! {

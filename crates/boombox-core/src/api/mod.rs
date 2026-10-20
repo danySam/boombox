@@ -17,7 +17,7 @@ pub use library_models::{
     SimplePlaylist,
 };
 pub use models::CurrentUser;
-pub use player::{Offset, PlayOptions, Playback, PlayerApi, SpectrumApi};
+pub use player::{ConnectHealth, Offset, PlayOptions, Playback, PlayerApi, SpectrumApi};
 pub use player_models::{
     Device, Devices, Pendings, PlaybackState, PlayingItem, Queue, RepeatState, Track,
 };

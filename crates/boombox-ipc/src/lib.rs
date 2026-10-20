@@ -16,7 +16,7 @@ use boombox_core::api::library_models::{
     SimplePlaylist,
 };
 use boombox_core::api::player::{PlayOptions, PlayerApi, SpectrumApi};
-use boombox_core::api::{Device, PlaybackState, Queue, RepeatState};
+use boombox_core::api::{ConnectHealth, Device, PlaybackState, Queue, RepeatState};
 use boombox_core::error::{Error, Result};
 use boombox_core::recent::Recent;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
@@ -296,9 +296,12 @@ impl SpectrumApi for IpcClient {
         }
     }
 
-    async fn streaming_outage(&self) -> Result<Option<String>> {
+    async fn connect_health(&self) -> Result<ConnectHealth> {
         match self.request(Request::Ping).await? {
-            Response::Pong(status) => Ok(outage_reason(status.streaming_state)),
+            Response::Pong(status) => Ok(ConnectHealth {
+                outage: outage_reason(status.streaming_state),
+                device_id: status.device_id,
+            }),
             Response::Error(e) => Err(e.into()),
             other => Err(unexpected(&other)),
         }
